@@ -15,6 +15,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 from fpn_correction import FPNCorrector
+from denoise import ThermalDenoiser
 
 # macOS .app bundles do not inherit the shell PATH. Add common Homebrew paths:
 os.environ['PATH'] += os.pathsep + '/opt/homebrew/bin' + os.pathsep + '/usr/local/bin'
@@ -65,11 +66,106 @@ KEY_DELTA_T = {ord('v'), ord('V')}
 KEY_TREND = {ord('w'), ord('W')}
 KEY_HISTOGRAM = {ord('b'), ord('B')}
 KEY_ANOMALY = {ord('n'), ord('N')}
+KEY_PALETTE_INVERT = {ord('z'), ord('Z')}
+KEY_DENOISE = {ord('g'), ord('G')}
 # Arrow keys: macOS 63232-63235, GTK 65361-65364, some 0-3 or 81-84
 KEY_ARROW_LEFT = {63234, 65361, 2, 84}
 KEY_ARROW_RIGHT = {63235, 65363, 3, 82}
 KEY_ARROW_UP = {63232, 65362, 0, 81}
 KEY_ARROW_DOWN = {63233, 65364, 1, 83}
+
+# --- Bottom toolbar: two rows of clickable icon-buttons ---
+TOOLBAR_H = 44
+_TB_ROW_H = 20
+_TB_PAD = 2
+
+_TOOLBAR_DEFS = [
+    # Row 0: Display & Measurement
+    ('palette', 'PAL'),  ('invert',  'INV'),  ('range',   'RNG'),  ('minmax',  'M/M'),
+    ('freeze',  'FRZ'),  ('snap',    'SNAP'), ('fahr',    'F/C'),
+    ('roi',     'ROI'),  ('line',    'LINE'), ('iso',     'ISO'),
+    ('hist',    'HIST'), ('trend',   'TRND'), ('anomaly', 'ANOM'),
+    ('delta',   'dT'),   ('alarm',   'ALM'),
+    # Row 1: Enhancement & Control
+    ('dde',     'DDE'),  ('cont_dn', 'C-'),   ('cont_up', 'C+'),
+    ('shrp_dn', 'S-'),   ('shrp_up', 'S+'),   ('fpn',     'FPN'),
+    ('fpn1',    '1FPN'), ('dnz',     'DNZ'),  ('rot_l',   'RoL'),  ('rot_r',   'RoR'),
+    ('flip_v',  'FlV'),  ('flip_h',  'FlH'),  ('debug',   'DBG'),
+    ('help',    'HLP'),  ('quit',    'QUIT'),
+]
+_TB_ROW0 = 15
+
+_TOOLBAR_KEY_MAP = {
+    'palette': ord('p'), 'invert': ord('z'), 'range': ord('0'), 'minmax': ord('m'),
+    'freeze': 32, 'snap': ord('s'), 'fahr': ord('f'),
+    'roi': ord('r'), 'line': ord('l'), 'iso': ord('t'),
+    'hist': ord('b'), 'trend': ord('w'), 'anomaly': ord('n'),
+    'delta': ord('v'), 'alarm': ord('a'),
+    'dde': ord('h'), 'cont_dn': ord('['), 'cont_up': ord(']'),
+    'shrp_dn': ord('-'), 'shrp_up': ord('='), 'fpn': ord('c'),
+    'fpn1': ord('x'), 'dnz': ord('g'), 'rot_l': 63234, 'rot_r': 63235,
+    'flip_v': 63232, 'flip_h': 63233, 'debug': ord('d'),
+    'help': ord('i'), 'quit': ord('q'),
+}
+
+_TOOLBAR_TOGGLES = {
+    'minmax', 'freeze', 'fahr', 'invert', 'roi', 'line', 'iso', 'hist',
+    'trend', 'anomaly', 'delta', 'alarm', 'dde', 'fpn', 'fpn1', 'dnz',
+    'flip_v', 'flip_h', 'debug', 'help',
+}
+
+
+def _toolbar_find_button(x, y_rel, dw):
+    """Return button id at (x, y_rel) where y_rel is relative to toolbar top."""
+    if y_rel < _TB_PAD or y_rel >= TOOLBAR_H:
+        return None
+    row_idx = min((y_rel - _TB_PAD) // _TB_ROW_H, 1)
+    row = _TOOLBAR_DEFS[:_TB_ROW0] if row_idx == 0 else _TOOLBAR_DEFS[_TB_ROW0:]
+    if not row:
+        return None
+    btn_w = dw / len(row)
+    idx = int(x / btn_w)
+    if 0 <= idx < len(row):
+        return row[idx][0]
+    return None
+
+
+def draw_toolbar(img, y0, dw, states, hover_id=None):
+    """Draw 2-row icon toolbar on *img* starting at row *y0*."""
+    img[y0:y0 + TOOLBAR_H, 0:dw] = (30, 30, 30)
+    cv2.line(img, (0, y0), (dw, y0), (80, 80, 80), 1)
+
+    for row_idx in range(2):
+        row = _TOOLBAR_DEFS[:_TB_ROW0] if row_idx == 0 else _TOOLBAR_DEFS[_TB_ROW0:]
+        ry = y0 + _TB_PAD + row_idx * _TB_ROW_H
+        btn_w = dw / len(row)
+
+        for i, (bid, label) in enumerate(row):
+            bx = int(i * btn_w) + 1
+            bx2 = int((i + 1) * btn_w) - 1
+            is_on = states.get(bid, False)
+            is_toggle = bid in _TOOLBAR_TOGGLES
+
+            if bid == 'quit':
+                bg = (30, 30, 70)
+                tc = (120, 120, 255)
+            elif is_toggle and is_on:
+                bg = (0, 90, 0)
+                tc = (100, 255, 100)
+            else:
+                bg = (55, 55, 55)
+                tc = (190, 190, 190)
+
+            if bid == hover_id:
+                bg = tuple(min(255, c + 35) for c in bg)
+                tc = (255, 255, 255)
+
+            cv2.rectangle(img, (bx, ry), (bx2, ry + _TB_ROW_H - 2), bg, -1)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.33, 1)
+            tx = bx + (bx2 - bx - tw) // 2
+            ty = ry + (_TB_ROW_H - 2 + th) // 2
+            cv2.putText(img, label, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.33, tc, 1, cv2.LINE_AA)
 
 
 def get_camera_index():
@@ -114,6 +210,7 @@ def _read_exact(stream, size):
 
 
 PANELS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.p2pro_layout.json')
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.p2pro_settings.json')
 _TITLE_H = 18
 _GRIP = 10
 
@@ -220,6 +317,41 @@ def save_panel_layout(panels):
     try:
         with open(PANELS_FILE, 'w') as f:
             json.dump({n: p.to_dict() for n, p in panels.items()}, f)
+    except OSError:
+        pass
+
+
+def load_app_settings(num_palettes):
+    """Load last palette and DDE (contrast/sharpness) settings. Returns dict."""
+    try:
+        with open(SETTINGS_FILE, 'r') as f:
+            data = json.load(f)
+        out = {}
+        if 'palette_idx' in data:
+            out['palette_idx'] = max(0, min(int(data['palette_idx']), num_palettes - 1))
+        if 'dde_clip_limit' in data:
+            out['dde_clip_limit'] = max(0.0, min(10.0, float(data['dde_clip_limit'])))
+        if 'dde_sharp_strength' in data:
+            out['dde_sharp_strength'] = max(0.0, min(10.0, float(data['dde_sharp_strength'])))
+        if 'dde_sharp_sigma' in data:
+            out['dde_sharp_sigma'] = max(0.2, min(5.0, float(data['dde_sharp_sigma'])))
+        if 'palette_invert' in data:
+            out['palette_invert'] = bool(data['palette_invert'])
+        return out
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError, KeyError):
+        return {}
+
+
+def save_app_settings(palette_idx, dde_clip_limit, dde_sharp_strength, dde_sharp_sigma, palette_invert=False):
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump({
+                'palette_idx': palette_idx,
+                'dde_clip_limit': dde_clip_limit,
+                'dde_sharp_strength': dde_sharp_strength,
+                'dde_sharp_sigma': dde_sharp_sigma,
+                'palette_invert': palette_invert,
+            }, f, indent=2)
     except OSError:
         pass
 
@@ -449,7 +581,7 @@ def main():
     print("Controls:")
     print("  'q' - Quit   'p' - Next Palette   'm' - Min/Max pointers   'd' - Debug")
     print("  SPACE - Freeze frame   's' - Snapshot   'f' - Celsius/Fahrenheit")
-    print("  '1'-'9' - Palette (LUT)   '0' - Temp range cycle: Auto / Room / Wide")
+    print("  '1'-'9' - Palette (LUT)   'z' - Invert palette   '0' - Temp range cycle: Auto / Room / Wide")
     print("  'r' - ROI: draw rectangle for min/max/avg   'a' - High temp alarm")
     print("  'h' - High quality: DDE (Detail Enhancement) & Sharpening")
     print("  '['/']' - Decrease/Increase DDE Contrast   '-'/'=' - Decrease/Increase Sharpness")
@@ -478,6 +610,7 @@ def main():
     alarm_threshold = 60.0  # Celsius
     high_quality_mode = False  # 'h': DDE
     show_controls_overlay = False  # 'i': show all keys
+    palette_invert = False  # 'z': invert colormap (hot/cold swap)
     fps_times = deque(maxlen=30)  # for FPS calculation
     
     # DDE Parameters
@@ -491,6 +624,9 @@ def main():
     # One-frame FPN: capture current frame on X, apply that offset to all following frames; X again = reset
     single_frame_fpn_enabled = False
     single_frame_offset_map = None  # float64 (192,256), offset to subtract each frame
+    # Thermal de-noise: temporal averaging + spatial bilateral filter
+    denoise_enabled = False
+    denoiser = ThermalDenoiser((192, 256))
     last_raw_bottom_half = None    # last raw thermal frame, for X capture
 
     line_profile_mode = False
@@ -565,6 +701,10 @@ def main():
     mouse_x, mouse_y = WIDTH // 2, HEIGHT // 2
     _panel_drag = {'ref': None}
 
+    _tb_display_dims = [WIDTH, HEIGHT]
+    _toolbar_injected_key = [-1]
+    _tb_hover_id = [None]
+
     # Initialize AI Super Resolution (FSRCNN)
     HAS_SR = False
     sr = None
@@ -575,6 +715,18 @@ def main():
     
     def on_mouse(event, x, y, flags, param):
         nonlocal mouse_x, mouse_y
+
+        tb_dh = _tb_display_dims[1]
+        if y >= tb_dh:
+            if event == cv2.EVENT_LBUTTONDOWN:
+                bid = _toolbar_find_button(x, y - tb_dh, _tb_display_dims[0])
+                if bid and bid in _TOOLBAR_KEY_MAP:
+                    _toolbar_injected_key[0] = _TOOLBAR_KEY_MAP[bid]
+            elif event == cv2.EVENT_MOUSEMOVE:
+                _tb_hover_id[0] = _toolbar_find_button(x, y - tb_dh, _tb_display_dims[0])
+            return
+        _tb_hover_id[0] = None
+
         mouse_x, mouse_y = display_to_logical(x, y)
 
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -641,6 +793,19 @@ def main():
 
     palette_idx = 0
 
+    # Restore last saved palette and DDE (contrast/sharpness) settings
+    _saved = load_app_settings(len(PALETTES))
+    if _saved:
+        palette_idx = _saved.get('palette_idx', palette_idx)
+        if 'dde_clip_limit' in _saved:
+            dde_clip_limit = _saved['dde_clip_limit']
+        if 'dde_sharp_strength' in _saved:
+            dde_sharp_strength = _saved['dde_sharp_strength']
+        if 'dde_sharp_sigma' in _saved:
+            dde_sharp_sigma = _saved['dde_sharp_sigma']
+        if 'palette_invert' in _saved:
+            palette_invert = _saved['palette_invert']
+
     def on_quit(icon, item):
         global running
         running = False
@@ -674,13 +839,33 @@ def main():
                 cv2.putText(display_frozen, "Q - Quit   P - Next palette   M - Min/Max   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_frozen, "SPACE - Resume   S - Snapshot   F - C/F", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_frozen, "1-9 - Palette   0 - Range   R - ROI   A - Alarm   H - DDE   [ ] = - DDE   I - Help", (20, y0), font, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+            _tb_display_dims[0], _tb_display_dims[1] = df_w, df_h
+            frozen_tb_states = {
+                'minmax': show_min_max, 'freeze': True, 'fahr': use_fahrenheit,
+                'invert': palette_invert, 'roi': roi_state['active'], 'line': line_profile_mode,
+                'iso': isotherm_enabled, 'hist': histogram_enabled,
+                'trend': trend_enabled, 'anomaly': anomaly_enabled,
+                'delta': delta_t_enabled, 'alarm': alarm_enabled,
+                'dde': high_quality_mode, 'fpn': fpn_enabled,
+                'fpn1': single_frame_fpn_enabled, 'dnz': denoise_enabled,
+                'flip_v': flip_v,
+                'flip_h': flip_h, 'debug': debug_mode, 'help': show_controls_overlay,
+            }
+            ftb = np.zeros((TOOLBAR_H, df_w, 3), dtype=np.uint8)
+            display_frozen = np.vstack([display_frozen, ftb])
+            draw_toolbar(display_frozen, df_h, df_w, frozen_tb_states, _tb_hover_id[0])
             cv2.imshow(window_name, display_frozen)
             key = cv2.waitKey(1)
             if window_closed():
                 break
+            if key < 0 and _toolbar_injected_key[0] >= 0:
+                key = _toolbar_injected_key[0]
+                _toolbar_injected_key[0] = -1
+            elif _toolbar_injected_key[0] >= 0:
+                _toolbar_injected_key[0] = -1
             if key < 0:
                 continue
-            key = key & 0xFFFF  # allow Unicode, strip modifiers
+            key = key & 0xFFFF
             if key in KEY_SPACE:
                 frozen = False
             elif key in KEY_PALETTE:
@@ -712,8 +897,14 @@ def main():
             elif key in KEY_FPN_ONE and single_frame_fpn_enabled:
                 single_frame_fpn_enabled = False
                 single_frame_offset_map = None
+            elif key in KEY_DENOISE:
+                denoise_enabled = not denoise_enabled
+                if not denoise_enabled:
+                    denoiser.reset()
             elif key in KEY_HELP:
                 show_controls_overlay = not show_controls_overlay
+            elif key in KEY_PALETTE_INVERT:
+                palette_invert = not palette_invert
             elif key in KEY_SNAPSHOT:
                 fn = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
                 cv2.imwrite(fn, apply_rotate_flip(frozen_frame))
@@ -758,6 +949,10 @@ def main():
         raw_min_c, raw_max_c = np.min(temp_celsius), np.max(temp_celsius)
         # Filter out obvious outliers
         temp_celsius = np.clip(temp_celsius, -20, 150)
+
+        # Temporal + spatial de-noise (G)
+        if denoise_enabled:
+            temp_celsius = denoiser.apply(temp_celsius)
         
         # Calculate min/max on the original 256x192 array for accuracy and speed
         min_temp = np.min(temp_celsius)
@@ -793,13 +988,16 @@ def main():
         # Upscale
         if high_quality_mode:
             # DDE (Digital Detail Enhancement) for Thermal Images
-            # 1. Local contrast enhancement via CLAHE on the raw grayscale image
-            clahe = cv2.createCLAHE(clipLimit=max(0.1, dde_clip_limit), tileGridSize=(8, 8))
-            enhanced = clahe.apply(normalized_small)
-            
+            # 1. Local contrast enhancement via CLAHE (skip when contrast=0)
+            if dde_clip_limit > 0:
+                clahe = cv2.createCLAHE(clipLimit=dde_clip_limit, tileGridSize=(8, 8))
+                enhanced = clahe.apply(normalized_small)
+            else:
+                enhanced = normalized_small
+
             # 2. High-quality mathematical upscale (preserves 100% of raw sensor details)
             normalized = cv2.resize(enhanced, (WIDTH, HEIGHT), interpolation=cv2.INTER_LANCZOS4)
-            
+
             # 3. Aggressive sharpening to make edges pop without hallucinating
             if dde_sharp_strength > 0:
                 normalized = unsharp_mask(normalized, sigma=dde_sharp_sigma, strength=dde_sharp_strength)
@@ -808,7 +1006,8 @@ def main():
             
         # Apply selected palette
         palette_name, colormap_flag = PALETTES[palette_idx]
-        colormap = cv2.applyColorMap(normalized, colormap_flag)
+        to_map = (255 - normalized).astype(np.uint8) if palette_invert else normalized
+        colormap = cv2.applyColorMap(to_map, colormap_flag)
         
         if isotherm_enabled:
             draw_isotherms(colormap, temp_celsius, range_min, range_max, SCALE, use_fahrenheit)
@@ -927,7 +1126,7 @@ def main():
             cv2.putText(display_img, f" HOT! {format_temp(max_temp, use_fahrenheit)} ", (dw // 2 - 80, dh // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
 
-        cv2.putText(display_img, f"Palette: {palette_name} (1-9,P) | Range: {'Auto' if range_preset == 0 else 'Room' if range_preset == 1 else 'Wide'} (0)",
+        cv2.putText(display_img, f"Palette: {palette_name}{' [inv]' if palette_invert else ''} (1-9,P,Z) | Range: {'Auto' if range_preset == 0 else 'Room' if range_preset == 1 else 'Wide'} (0)",
                     (10, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         if high_quality_mode:
             cv2.putText(display_img, f" HQ (H) | Cont: {dde_clip_limit:.1f} | Shrp: {dde_sharp_strength:.1f} ",
@@ -951,6 +1150,10 @@ def main():
             (sw, _), _ = cv2.getTextSize(" FPN (C) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
             cv2.putText(display_img, " FPN (C) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 255, 200), 1, cv2.LINE_AA)
             status_right -= sw + 8
+        if denoise_enabled:
+            (sw, _), _ = cv2.getTextSize(" DNZ (G) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
+            cv2.putText(display_img, " DNZ (G) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (100, 200, 255), 1, cv2.LINE_AA)
+            status_right -= sw + 8
         if delta_t_enabled:
             (sw, _), _ = cv2.getTextSize(" Delta-T (V) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
             cv2.putText(display_img, " Delta-T (V) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 200, 255), 1, cv2.LINE_AA)
@@ -972,12 +1175,13 @@ def main():
             cv2.putText(display_img, "--- CONTROLS (I to close) ---", (20, y0), font, 0.55, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "Q - Quit   P - Next palette   M - Min/Max markers   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "SPACE - Freeze frame   S - Snapshot   F - Celsius/Fahrenheit", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(display_img, "1-9 - Palette (LUT)   P - Next palette   0 - Temp range: Auto / Room / Wide", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "1-9 - Palette   P - Next   Z - Invert palette   0 - Temp range: Auto / Room / Wide", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "R - ROI: draw rectangle (min/avg/max)   A - High temp alarm", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "H - High quality: DDE + Sharpening", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "[ ] - DDE Contrast less/more   - = - Sharpness less/more", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "C - FPN correction (running calibration)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "X - One-frame FPN: capture current frame, apply to all; X again = reset", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "G - De-noise: temporal averaging + bilateral filter (matrix noise)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "L - Line profile   T - Isotherms   V - Delta-T mode", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "W - Temp trend   B - Histogram   N - Anomaly detection", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "Left/Right - Rotate 90 deg   Up/Down - Flip V/H", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
@@ -1006,14 +1210,34 @@ def main():
             cv2.putText(display_img, f"temp_celsius shape: {temp_celsius.shape}", (15, y0), font, fs, (200, 200, 255), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"high_quality_mode: {high_quality_mode} (DDE Sharpness)", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA)
 
+        _tb_display_dims[0], _tb_display_dims[1] = dw, dh
+        tb_states = {
+            'minmax': show_min_max, 'freeze': frozen, 'fahr': use_fahrenheit,
+            'invert': palette_invert, 'roi': roi_state['active'], 'line': line_profile_mode,
+            'iso': isotherm_enabled, 'hist': histogram_enabled,
+            'trend': trend_enabled, 'anomaly': anomaly_enabled,
+            'delta': delta_t_enabled, 'alarm': alarm_enabled,
+            'dde': high_quality_mode, 'fpn': fpn_enabled,
+            'fpn1': single_frame_fpn_enabled, 'dnz': denoise_enabled,
+            'flip_v': flip_v,
+            'flip_h': flip_h, 'debug': debug_mode, 'help': show_controls_overlay,
+        }
+        tb_strip = np.zeros((TOOLBAR_H, dw, 3), dtype=np.uint8)
+        display_img = np.vstack([display_img, tb_strip])
+        draw_toolbar(display_img, dh, dw, tb_states, _tb_hover_id[0])
         cv2.imshow(window_name, display_img)
 
         key = cv2.waitKey(1)
         if window_closed():
             break
+        if key < 0 and _toolbar_injected_key[0] >= 0:
+            key = _toolbar_injected_key[0]
+            _toolbar_injected_key[0] = -1
+        elif _toolbar_injected_key[0] >= 0:
+            _toolbar_injected_key[0] = -1
         if key < 0:
             continue
-        key = key & 0xFFFF  # allow Unicode, strip high modifier bits
+        key = key & 0xFFFF
         if key in KEY_QUIT:
             break
         elif key in KEY_PALETTE:
@@ -1051,6 +1275,8 @@ def main():
             print(f"Saved {fn}")
         elif key in KEY_FAHRENHEIT:
             use_fahrenheit = not use_fahrenheit
+        elif key in KEY_PALETTE_INVERT:
+            palette_invert = not palette_invert
         elif key in KEY_ROI:
             roi_state['active'] = not roi_state['active']
             if roi_state['active']:
@@ -1064,7 +1290,7 @@ def main():
         elif key in KEY_HQ:
             high_quality_mode = not high_quality_mode
         elif key in KEY_BRACKET_L:
-            dde_clip_limit = max(0.1, dde_clip_limit - 0.5)
+            dde_clip_limit = max(0.0, dde_clip_limit - 0.5)
         elif key in KEY_BRACKET_R:
             dde_clip_limit += 0.5
         elif key in KEY_SHARP_MINUS:
@@ -1112,6 +1338,10 @@ def main():
             histogram_enabled = not histogram_enabled
         elif key in KEY_ANOMALY:
             anomaly_enabled = not anomaly_enabled
+        elif key in KEY_DENOISE:
+            denoise_enabled = not denoise_enabled
+            if not denoise_enabled:
+                denoiser.reset()
         elif key in KEY_ARROW_LEFT:
             rotation_deg = (rotation_deg - 90) % 360
         elif key in KEY_ARROW_RIGHT:
@@ -1121,6 +1351,7 @@ def main():
         elif key in KEY_ARROW_DOWN:
             flip_h = not flip_h
 
+    save_app_settings(palette_idx, dde_clip_limit, dde_sharp_strength, dde_sharp_sigma, palette_invert)
     save_panel_layout(panels)
     reader.running = False
     process.terminate()

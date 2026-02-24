@@ -1,6 +1,6 @@
 # P2 Pro Thermal Camera Viewer
 
-![Demo](demo.gif)
+![Demo](demo_400.gif)
 
 Real-time thermal imaging desktop app for the **Infiray P2 Pro** USB camera. Captures the raw YUYV stream (256×384), extracts the 256×192 thermal layer, converts to temperature, and displays with colormaps, measurement tools, and optional analysis overlays. Optimized for **macOS** (AVFoundation + ffmpeg); includes system tray and optional PyInstaller build.
 

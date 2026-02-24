@@ -12,6 +12,7 @@ FSRCNN_x3.pb
 
 # User state and captures
 .p2pro_layout.json
+.p2pro_settings.json
 snapshot_*.png
 
 # Video files (source recordings, avoid large binaries in repo)
