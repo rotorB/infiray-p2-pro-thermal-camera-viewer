@@ -14,6 +14,14 @@ FSRCNN_x3.pb
 .p2pro_layout.json
 snapshot_*.png
 
+# Video files (source recordings, avoid large binaries in repo)
+*.mov
+*.mp4
+*.avi
+*.mkv
+*.webm
+Screen Recording*.mov
+
 # Test / dev
 test_tray.py
 test_frame.jpg

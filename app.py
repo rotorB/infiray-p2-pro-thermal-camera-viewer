@@ -31,40 +31,45 @@ PALETTES.append(("Rainbow", cv2.COLORMAP_RAINBOW))
 PALETTES.append(("Bone", cv2.COLORMAP_BONE))
 PALETTES.append(("Ocean", cv2.COLORMAP_OCEAN))
 
-# Physical key codes: same key works in any layout (US QWERTY + Russian Cyrillic on same key position)
-KEY_QUIT = {113, 81, 1081, 1049}      # Q
-KEY_PALETTE = {112, 80, 1079, 1047}   # P
-KEY_MINMAX = {109, 77, 1100, 1068}    # M
-KEY_DEBUG = {100, 68, 1074, 1042}     # D
+# Key codes: Latin letters (lowercase + uppercase) and common arrow/special codes
+KEY_QUIT = {ord('q'), ord('Q')}
+KEY_PALETTE = {ord('p'), ord('P')}
+KEY_MINMAX = {ord('m'), ord('M')}
+KEY_DEBUG = {ord('d'), ord('D')}
 KEY_SPACE = {32}
-KEY_SNAPSHOT = {115, 83, 1099, 1067}  # S
-KEY_FAHRENHEIT = {102, 70, 1072, 1040}  # F
-KEY_PALETTE_1 = {49}   # 1 -> LUT 0
-KEY_PALETTE_2 = {50}   # 2 -> LUT 1
-KEY_PALETTE_3 = {51}   # 3 -> LUT 2
-KEY_PALETTE_4 = {52}   # 4
-KEY_PALETTE_5 = {53}   # 5
-KEY_PALETTE_6 = {54}   # 6
-KEY_PALETTE_7 = {55}   # 7
-KEY_PALETTE_8 = {56}   # 8
-KEY_PALETTE_9 = {57}   # 9
-KEY_RANGE_CYCLE = {48}  # 0 -> cycle temp range (Auto / Room / Wide)
-KEY_ROI = {114, 82, 1082, 1050}       # R
-KEY_ALARM = {97, 65, 1092, 1060}      # A
-KEY_HQ = {104, 72, 1088, 1056}        # H
-KEY_BRACKET_L = {91, 1093, 1061}      # [
-KEY_BRACKET_R = {93, 1098, 1066}      # ]
-KEY_SHARP_MINUS = {45}                # -
-KEY_SHARP_PLUS = {61, 43}             # = and +
-KEY_HELP = {105, 73, 1087, 1063}      # I
-KEY_FPN = {99, 67, 1089, 1057}        # C - FPN (fixed-pattern) correction
-KEY_FPN_ONE = {120, 88, 1095, 1061}   # X - one-frame FPN (capture current frame, apply to all; X again = reset)
-KEY_LINE_PROFILE = {108, 76, 1076, 1044}  # L - Line temperature profile
-KEY_ISOTHERM = {116, 84, 1077, 1045}      # T - Isotherms
-KEY_DELTA_T = {118, 86, 1084, 1052}       # V - Delta-T mode
-KEY_TREND = {119, 87, 1094, 1062}         # W - Temperature trend
-KEY_HISTOGRAM = {98, 66, 1080, 1048}      # B - Temperature histogram
-KEY_ANOMALY = {110, 78, 1090, 1058}       # N - Anomaly detection
+KEY_SNAPSHOT = {ord('s'), ord('S')}
+KEY_FAHRENHEIT = {ord('f'), ord('F')}
+KEY_PALETTE_1 = {ord('1')}
+KEY_PALETTE_2 = {ord('2')}
+KEY_PALETTE_3 = {ord('3')}
+KEY_PALETTE_4 = {ord('4')}
+KEY_PALETTE_5 = {ord('5')}
+KEY_PALETTE_6 = {ord('6')}
+KEY_PALETTE_7 = {ord('7')}
+KEY_PALETTE_8 = {ord('8')}
+KEY_PALETTE_9 = {ord('9')}
+KEY_RANGE_CYCLE = {ord('0')}
+KEY_ROI = {ord('r'), ord('R')}
+KEY_ALARM = {ord('a'), ord('A')}
+KEY_HQ = {ord('h'), ord('H')}
+KEY_BRACKET_L = {ord('[')}
+KEY_BRACKET_R = {ord(']')}
+KEY_SHARP_MINUS = {ord('-')}
+KEY_SHARP_PLUS = {ord('='), ord('+')}
+KEY_HELP = {ord('i'), ord('I')}
+KEY_FPN = {ord('c'), ord('C')}
+KEY_FPN_ONE = {ord('x'), ord('X')}
+KEY_LINE_PROFILE = {ord('l'), ord('L')}
+KEY_ISOTHERM = {ord('t'), ord('T')}
+KEY_DELTA_T = {ord('v'), ord('V')}
+KEY_TREND = {ord('w'), ord('W')}
+KEY_HISTOGRAM = {ord('b'), ord('B')}
+KEY_ANOMALY = {ord('n'), ord('N')}
+# Arrow keys: macOS 63232-63235, GTK 65361-65364, some 0-3 or 81-84
+KEY_ARROW_LEFT = {63234, 65361, 2, 84}
+KEY_ARROW_RIGHT = {63235, 65363, 3, 82}
+KEY_ARROW_UP = {63232, 65362, 0, 81}
+KEY_ARROW_DOWN = {63233, 65364, 1, 83}
 
 
 def get_camera_index():
@@ -451,6 +456,7 @@ def main():
     print("  'c' - FPN correction (running)   'x' - FPN from one frame   'i' - Help")
     print("  'l' - Line profile   't' - Isotherms   'v' - Delta-T mode")
     print("  'w' - Temp trend   'b' - Histogram   'n' - Anomaly detection")
+    print("  Left/Right arrows - Rotate 90 deg   Up/Down arrows - Flip vertical/horizontal")
     
     # Upscale factor (e.g. 3 means 256x192 -> 768x576)
     SCALE = 3
@@ -497,6 +503,57 @@ def main():
     histogram_enabled = False
     anomaly_enabled = False
 
+    # Rotate (0, 90, 180, 270) and flip for display
+    rotation_deg = 0
+    flip_h = False
+    flip_v = False
+
+    def apply_rotate_flip(img):
+        out = img.copy()
+        if flip_v:
+            out = cv2.flip(out, 0)
+        if flip_h:
+            out = cv2.flip(out, 1)
+        if rotation_deg == 90:
+            out = cv2.rotate(out, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation_deg == 180:
+            out = cv2.rotate(out, cv2.ROTATE_180)
+        elif rotation_deg == 270:
+            out = cv2.rotate(out, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return out
+
+    def display_to_logical(dx, dy):
+        """Convert display (window) coords to logical image coords (for cursor, ROI, etc.)."""
+        disp_w = HEIGHT if rotation_deg in (90, 270) else WIDTH
+        disp_h = WIDTH if rotation_deg in (90, 270) else HEIGHT
+        dx = max(0, min(dx, disp_w - 1))
+        dy = max(0, min(dy, disp_h - 1))
+        if rotation_deg == 90:
+            lx, ly = dy, HEIGHT - 1 - dx
+        elif rotation_deg == 180:
+            lx, ly = WIDTH - 1 - dx, HEIGHT - 1 - dy
+        elif rotation_deg == 270:
+            lx, ly = WIDTH - 1 - dy, dx
+        else:
+            lx, ly = dx, dy
+        if flip_h:
+            lx = WIDTH - 1 - lx
+        if flip_v:
+            ly = HEIGHT - 1 - ly
+        return (max(0, min(lx, WIDTH - 1)), max(0, min(ly, HEIGHT - 1)))
+
+    def logical_to_display(lx, ly):
+        """Convert logical image coords to display coords (for drawing text on display_img)."""
+        px = (WIDTH - 1 - lx) if flip_h else lx
+        py = (HEIGHT - 1 - ly) if flip_v else ly
+        if rotation_deg == 90:
+            return (HEIGHT - 1 - py, px)
+        if rotation_deg == 180:
+            return (WIDTH - 1 - px, HEIGHT - 1 - py)
+        if rotation_deg == 270:
+            return (py, WIDTH - 1 - px)
+        return (px, py)
+
     panels = {
         'trend': Panel("Trend (W)", WIDTH - 185, 45, 180, 130),
         'histogram': Panel("Histogram (B)", WIDTH - 185, 185, 180, 110),
@@ -518,7 +575,7 @@ def main():
     
     def on_mouse(event, x, y, flags, param):
         nonlocal mouse_x, mouse_y
-        mouse_x, mouse_y = min(max(0, x), WIDTH - 1), min(max(0, y), HEIGHT - 1)
+        mouse_x, mouse_y = display_to_logical(x, y)
 
         if event == cv2.EVENT_LBUTTONDOWN:
             lp_shown = (line_profile_mode and line_profile.get('start')
@@ -603,20 +660,21 @@ def main():
 
     while reader.running and running:
         if frozen and frozen_frame is not None:
-            show_frozen = frozen_frame.copy()
-            cv2.putText(show_frozen, " FROZEN (SPACE to resume) ", (WIDTH // 2 - 120, 40),
+            display_frozen = apply_rotate_flip(frozen_frame.copy())
+            df_h, df_w = display_frozen.shape[:2]
+            cv2.putText(display_frozen, " FROZEN (SPACE to resume) ", (df_w // 2 - 120, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
             if show_controls_overlay:
-                overlay = show_frozen.copy()
-                cv2.rectangle(overlay, (10, 10), (WIDTH - 10, HEIGHT - 10), (30, 30, 30), -1)
-                cv2.addWeighted(overlay, 0.88, show_frozen, 0.12, 0, show_frozen)
+                overlay = display_frozen.copy()
+                cv2.rectangle(overlay, (10, 10), (df_w - 10, df_h - 10), (30, 30, 30), -1)
+                cv2.addWeighted(overlay, 0.88, display_frozen, 0.12, 0, display_frozen)
                 line_h, y0 = 24, 35
                 font, fs = cv2.FONT_HERSHEY_SIMPLEX, 0.5
-                cv2.putText(show_frozen, "--- CONTROLS (I to close) ---", (20, y0), font, 0.55, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(show_frozen, "Q - Quit   P - Next palette   M - Min/Max   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(show_frozen, "SPACE - Resume   S - Snapshot   F - C/F", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(show_frozen, "1-9 - Palette   0 - Range   R - ROI   A - Alarm   H - DDE   [ ] = - DDE   I - Help", (20, y0), font, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
-            cv2.imshow(window_name, show_frozen)
+                cv2.putText(display_frozen, "--- CONTROLS (I to close) ---", (20, y0), font, 0.55, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_frozen, "Q - Quit   P - Next palette   M - Min/Max   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_frozen, "SPACE - Resume   S - Snapshot   F - C/F", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_frozen, "1-9 - Palette   0 - Range   R - ROI   A - Alarm   H - DDE   [ ] = - DDE   I - Help", (20, y0), font, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+            cv2.imshow(window_name, display_frozen)
             key = cv2.waitKey(1)
             if window_closed():
                 break
@@ -658,10 +716,18 @@ def main():
                 show_controls_overlay = not show_controls_overlay
             elif key in KEY_SNAPSHOT:
                 fn = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                cv2.imwrite(fn, frozen_frame)
+                cv2.imwrite(fn, apply_rotate_flip(frozen_frame))
                 print(f"Saved {fn}")
             elif key in KEY_QUIT:
                 break
+            elif key in KEY_ARROW_LEFT:
+                rotation_deg = (rotation_deg - 90) % 360
+            elif key in KEY_ARROW_RIGHT:
+                rotation_deg = (rotation_deg + 90) % 360
+            elif key in KEY_ARROW_UP:
+                flip_v = not flip_v
+            elif key in KEY_ARROW_DOWN:
+                flip_h = not flip_h
             continue
 
         raw_bytes = reader.get_latest_frame()
@@ -756,34 +822,20 @@ def main():
         else:
             cursor_temp = 0.0
         
-        # Draw min/max markers only when enabled
+        # Draw min/max markers only when enabled (markers on colormap; labels drawn on display later)
         if show_min_max:
             cv2.drawMarker(colormap, (min_x, min_y), (255, 100, 0), cv2.MARKER_TRIANGLE_DOWN, 24, 2)  # blue = min
-            cv2.putText(colormap, f"MIN {format_temp(min_temp, use_fahrenheit)}", (min_x + 12, min_y + 8), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2, cv2.LINE_AA)
             cv2.drawMarker(colormap, (max_x, max_y), (0, 0, 255), cv2.MARKER_TRIANGLE_UP, 24, 2)   # red = max
-            cv2.putText(colormap, f"MAX {format_temp(max_temp, use_fahrenheit)}", (max_x + 12, max_y - 8), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2, cv2.LINE_AA)
         
         if trend_enabled:
             trend_data.append(cursor_temp)
 
-        # Draw crosshair and temperature at cursor
+        # Draw crosshair at cursor (text drawn on display later)
         cv2.drawMarker(colormap, (mouse_x, mouse_y), (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
         cursor_label = format_temp(cursor_temp, use_fahrenheit)
         if delta_display is not None:
             d = delta_display[mouse_y // SCALE, mouse_x // SCALE]
             cursor_label += f" ({'+' if d >= 0 else ''}{d:.1f})"
-        cv2.putText(colormap, cursor_label, (mouse_x + 10, mouse_y - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
-        
-        if delta_display is not None:
-            d_min, d_max = float(np.min(delta_display)), float(np.max(delta_display))
-            cv2.putText(colormap, f"DELTA-T: {d_min:+.1f} to {d_max:+.1f} C  (V to reset)", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
-        else:
-            cv2.putText(colormap, f"Min: {format_temp(min_temp, use_fahrenheit)}  Max: {format_temp(max_temp, use_fahrenheit)}", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         
         if roi_state['start'] and roi_state['end']:
             x1, y1 = min(roi_state['start'][0], roi_state['end'][0]), min(roi_state['start'][1], roi_state['end'][1])
@@ -797,19 +849,8 @@ def main():
                 roi_min, roi_max = np.min(roi_temps), np.max(roi_temps)
                 roi_avg = np.mean(roi_temps)
                 cv2.rectangle(colormap, (x1, y1), (x2, y2), (0, 255, 255), 2)
-                cv2.putText(colormap, f"ROI: {format_temp(roi_min, use_fahrenheit)} / {format_temp(roi_avg, use_fahrenheit)} / {format_temp(roi_max, use_fahrenheit)}", (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
         if alarm_enabled and max_temp >= alarm_threshold:
             cv2.rectangle(colormap, (0, 0), (WIDTH - 1, HEIGHT - 1), (0, 0, 255), 4)
-            cv2.putText(colormap, f" HOT! {format_temp(max_temp, use_fahrenheit)} ", (WIDTH // 2 - 80, HEIGHT // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
-                    
-        cv2.putText(colormap, f"Palette: {palette_name} (1-9,P) | Range: {'Auto' if range_preset == 0 else 'Room' if range_preset == 1 else 'Wide'} (0)", (10, HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-        if high_quality_mode:
-            cv2.putText(colormap, f" HQ (H) | Cont: {dde_clip_limit:.1f} | Shrp: {dde_sharp_strength:.1f} ", (WIDTH - 280, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1, cv2.LINE_AA)
-
-        if roi_state['active']:
-            cv2.putText(colormap, "ROI: drag (R cancel)", (10, HEIGHT - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-        elif line_profile_mode:
-            cv2.putText(colormap, "LINE: drag to draw (L cancel)", (10, HEIGHT - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
 
         # FPS calculation: frames per second = num_frames / elapsed_time
         if len(fps_times) >= 2:
@@ -817,37 +858,13 @@ def main():
             fps = len(fps_times) / elapsed if elapsed > 0 else 0.0
         else:
             fps = 0.0
-            
-        # Draw FPS in bottom right (white, slightly larger)
         fps_text = f"{fps:.1f} FPS"
         fps_scale = 0.55
         (fw, fh), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, fps_scale, 1)
         fps_x = WIDTH - fw - 10
-        cv2.putText(colormap, fps_text, (fps_x, HEIGHT - 10), cv2.FONT_HERSHEY_SIMPLEX, fps_scale, (255, 255, 255), 1, cv2.LINE_AA)
-        # FPN status labels: leave gap left of FPS so they don't overlap
         status_scale = 0.45
         gap = 20
         status_right = fps_x - gap
-        if single_frame_fpn_enabled:
-            (sw, _), _ = cv2.getTextSize(" 1-frame FPN (X) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
-            cv2.putText(colormap, " 1-frame FPN (X) ", (status_right - sw, HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (200, 255, 200), 1, cv2.LINE_AA)
-            status_right -= sw + 8
-        if fpn_enabled:
-            (sw, _), _ = cv2.getTextSize(" FPN (C) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
-            cv2.putText(colormap, " FPN (C) ", (status_right - sw, HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 255, 200), 1, cv2.LINE_AA)
-            status_right -= sw + 8
-        if delta_t_enabled:
-            (sw, _), _ = cv2.getTextSize(" Delta-T (V) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
-            cv2.putText(colormap, " Delta-T (V) ", (status_right - sw, HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 200, 255), 1, cv2.LINE_AA)
-            status_right -= sw + 8
-        if isotherm_enabled:
-            (sw, _), _ = cv2.getTextSize(" ISO (T) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
-            cv2.putText(colormap, " ISO (T) ", (status_right - sw, HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (200, 200, 0), 1, cv2.LINE_AA)
-            status_right -= sw + 8
-        if anomaly_enabled:
-            (sw, _), _ = cv2.getTextSize(" AI (N) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
-            cv2.putText(colormap, " AI (N) ", (status_right - sw, HEIGHT - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 0, 255), 1, cv2.LINE_AA)
-            status_right -= sw + 8
 
         if line_profile_mode and line_profile['start'] and line_profile['end']:
             if line_profile.get('dragging'):
@@ -861,51 +878,134 @@ def main():
         if histogram_enabled:
             draw_histogram(colormap, temp_celsius, use_fahrenheit, panels['histogram'])
 
-        # Controls overlay (key 'i')
+        display_img = apply_rotate_flip(colormap)
+        dh, dw = display_img.shape[:2]
+
+        # --- All text/overlay drawn on display_img in SCREEN coords (always readable, fixed positions) ---
+
+        # Cursor label follows mouse in screen space
+        cmx, cmy = logical_to_display(mouse_x, mouse_y)
+        cmx, cmy = max(0, min(cmx, dw - 1)), max(0, min(cmy, dh - 1))
+        cv2.putText(display_img, cursor_label, (cmx + 10, cmy - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+        # Min/Max labels follow their markers in screen space
+        if show_min_max:
+            dmn = logical_to_display(min_x, min_y)
+            cv2.putText(display_img, f"MIN {format_temp(min_temp, use_fahrenheit)}",
+                        (dmn[0] + 12, dmn[1] + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2, cv2.LINE_AA)
+            dmx = logical_to_display(max_x, max_y)
+            cv2.putText(display_img, f"MAX {format_temp(max_temp, use_fahrenheit)}",
+                        (dmx[0] + 12, dmx[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2, cv2.LINE_AA)
+
+        # ROI label follows ROI in screen space
+        if roi_state['start'] and roi_state['end']:
+            x1, y1 = min(roi_state['start'][0], roi_state['end'][0]), min(roi_state['start'][1], roi_state['end'][1])
+            x2, y2 = max(roi_state['start'][0], roi_state['end'][0]), max(roi_state['start'][1], roi_state['end'][1])
+            x1, x2 = max(0, x1), min(WIDTH, x2)
+            y1, y2 = max(0, y1), min(HEIGHT, y2)
+            if x2 > x1 and y2 > y1:
+                sx1, sy1 = x1 // SCALE, y1 // SCALE
+                sx2, sy2 = max(sx1 + 1, x2 // SCALE), max(sy1 + 1, y2 // SCALE)
+                roi_temps = temp_celsius[sy1:sy2, sx1:sx2]
+                roi_min, roi_max = np.min(roi_temps), np.max(roi_temps)
+                roi_avg = np.mean(roi_temps)
+                dr = logical_to_display(x1, y1)
+                cv2.putText(display_img, f"ROI: {format_temp(roi_min, use_fahrenheit)} / {format_temp(roi_avg, use_fahrenheit)} / {format_temp(roi_max, use_fahrenheit)}",
+                            (dr[0], dr[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # --- Fixed HUD: always at screen edges, using dw/dh ---
+        if delta_display is not None:
+            d_min, d_max = float(np.min(delta_display)), float(np.max(delta_display))
+            cv2.putText(display_img, f"DELTA-T: {d_min:+.1f} to {d_max:+.1f} C  (V to reset)", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
+        else:
+            cv2.putText(display_img, f"Min: {format_temp(min_temp, use_fahrenheit)}  Max: {format_temp(max_temp, use_fahrenheit)}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+        if alarm_enabled and max_temp >= alarm_threshold:
+            cv2.putText(display_img, f" HOT! {format_temp(max_temp, use_fahrenheit)} ", (dw // 2 - 80, dh // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
+
+        cv2.putText(display_img, f"Palette: {palette_name} (1-9,P) | Range: {'Auto' if range_preset == 0 else 'Room' if range_preset == 1 else 'Wide'} (0)",
+                    (10, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        if high_quality_mode:
+            cv2.putText(display_img, f" HQ (H) | Cont: {dde_clip_limit:.1f} | Shrp: {dde_sharp_strength:.1f} ",
+                        (dw - 280, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1, cv2.LINE_AA)
+        if roi_state['active']:
+            cv2.putText(display_img, "ROI: drag (R cancel)", (10, dh - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+        elif line_profile_mode:
+            cv2.putText(display_img, "LINE: drag to draw (L cancel)", (10, dh - 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
+
+        (fw, _), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, fps_scale, 1)
+        d_fps_x = dw - fw - 10
+        cv2.putText(display_img, fps_text, (d_fps_x, dh - 10), cv2.FONT_HERSHEY_SIMPLEX, fps_scale, (255, 255, 255), 1, cv2.LINE_AA)
+        status_right = d_fps_x - gap
+        if single_frame_fpn_enabled:
+            (sw, _), _ = cv2.getTextSize(" 1-frame FPN (X) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
+            cv2.putText(display_img, " 1-frame FPN (X) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (200, 255, 200), 1, cv2.LINE_AA)
+            status_right -= sw + 8
+        if fpn_enabled:
+            (sw, _), _ = cv2.getTextSize(" FPN (C) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
+            cv2.putText(display_img, " FPN (C) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 255, 200), 1, cv2.LINE_AA)
+            status_right -= sw + 8
+        if delta_t_enabled:
+            (sw, _), _ = cv2.getTextSize(" Delta-T (V) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
+            cv2.putText(display_img, " Delta-T (V) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 200, 255), 1, cv2.LINE_AA)
+            status_right -= sw + 8
+        if isotherm_enabled:
+            (sw, _), _ = cv2.getTextSize(" ISO (T) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
+            cv2.putText(display_img, " ISO (T) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (200, 200, 0), 1, cv2.LINE_AA)
+            status_right -= sw + 8
+        if anomaly_enabled:
+            (sw, _), _ = cv2.getTextSize(" AI (N) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
+            cv2.putText(display_img, " AI (N) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 0, 255), 1, cv2.LINE_AA)
+
         if show_controls_overlay:
-            overlay = colormap.copy()
-            cv2.rectangle(overlay, (10, 10), (WIDTH - 10, HEIGHT - 10), (30, 30, 30), -1)
-            cv2.addWeighted(overlay, 0.88, colormap, 0.12, 0, colormap)
+            overlay = display_img.copy()
+            cv2.rectangle(overlay, (10, 10), (dw - 10, dh - 10), (30, 30, 30), -1)
+            cv2.addWeighted(overlay, 0.88, display_img, 0.12, 0, display_img)
             line_h, y0 = 24, 35
             font, fs = cv2.FONT_HERSHEY_SIMPLEX, 0.5
-            cv2.putText(colormap, "--- CONTROLS (I to close) ---", (20, y0), font, 0.55, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "Q - Quit   P - Next palette   M - Min/Max markers   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "SPACE - Freeze frame   S - Snapshot   F - Celsius/Fahrenheit", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "1-9 - Palette (LUT)   P - Next palette   0 - Temp range: Auto / Room / Wide", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "R - ROI: draw rectangle (min/avg/max)   A - High temp alarm", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "H - High quality: DDE + Sharpening", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "[ ] - DDE Contrast less/more   - = - Sharpness less/more", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "C - FPN correction (running calibration)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "X - One-frame FPN: capture current frame, apply to all; X again = reset", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "L - Line profile   T - Isotherms   V - Delta-T mode", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "W - Temp trend   B - Histogram   N - Anomaly detection", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, "I - Show/hide this help", (20, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA)
+            cv2.putText(display_img, "--- CONTROLS (I to close) ---", (20, y0), font, 0.55, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "Q - Quit   P - Next palette   M - Min/Max markers   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "SPACE - Freeze frame   S - Snapshot   F - Celsius/Fahrenheit", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "1-9 - Palette (LUT)   P - Next palette   0 - Temp range: Auto / Room / Wide", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "R - ROI: draw rectangle (min/avg/max)   A - High temp alarm", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "H - High quality: DDE + Sharpening", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "[ ] - DDE Contrast less/more   - = - Sharpness less/more", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "C - FPN correction (running calibration)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "X - One-frame FPN: capture current frame, apply to all; X again = reset", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "L - Line profile   T - Isotherms   V - Delta-T mode", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "W - Temp trend   B - Histogram   N - Anomaly detection", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "Left/Right - Rotate 90 deg   Up/Down - Flip V/H", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "I - Show/hide this help", (20, y0), font, fs, (200, 255, 200), 1)
 
         if debug_mode:
-            overlay = colormap.copy()
-            cv2.rectangle(overlay, (10, 50), (WIDTH - 10, HEIGHT - 50), (20, 20, 20), -1)
-            cv2.addWeighted(overlay, 0.75, colormap, 0.25, 0, colormap)
+            overlay = display_img.copy()
+            cv2.rectangle(overlay, (10, 50), (dw - 10, dh - 50), (20, 20, 20), -1)
+            cv2.addWeighted(overlay, 0.75, display_img, 0.25, 0, display_img)
             line_h, y0 = 22, 65
             font, fs = cv2.FONT_HERSHEY_SIMPLEX, 0.55
-            
-            cv2.putText(colormap, "--- DEBUG (D to toggle) ---", (15, y0), font, fs, (200, 200, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"FPS: {fps:.1f}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"frame_count: {frame_count}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"cam_index: {cam_index}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"frame_size (bytes): {frame_size}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"SCALE: {SCALE}  WIDTH: {WIDTH}  HEIGHT: {HEIGHT}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"palette_idx: {palette_idx}  palette: {palette_name}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"show_min_max: {show_min_max}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"reader.running: {reader.running}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"raw temp (before clip) min: {raw_min_c:.2f} C  max: {raw_max_c:.2f} C", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"display temp min: {min_temp:.2f} C  max: {max_temp:.2f} C", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"min_pt: ({min_x}, {min_y})  max_pt: ({max_x}, {max_y})", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"cursor: ({mouse_x}, {mouse_y})  cursor_temp: {cursor_temp:.2f} C", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"bottom_half shape: {bottom_half.shape}  dtype: {bottom_half.dtype}", (15, y0), font, fs, (200, 200, 255), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"temp_celsius shape: {temp_celsius.shape}", (15, y0), font, fs, (200, 200, 255), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(colormap, f"high_quality_mode: {high_quality_mode} (DDE Sharpness)", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA)
+            cv2.putText(display_img, "--- DEBUG (D to toggle) ---", (15, y0), font, fs, (200, 200, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"FPS: {fps:.1f}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"frame_count: {frame_count}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"cam_index: {cam_index}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"frame_size (bytes): {frame_size}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"SCALE: {SCALE}  WIDTH: {WIDTH}  HEIGHT: {HEIGHT}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"palette_idx: {palette_idx}  palette: {palette_name}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"show_min_max: {show_min_max}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"reader.running: {reader.running}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"raw temp (before clip) min: {raw_min_c:.2f} C  max: {raw_max_c:.2f} C", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"display temp min: {min_temp:.2f} C  max: {max_temp:.2f} C", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"min_pt: ({min_x}, {min_y})  max_pt: ({max_x}, {max_y})", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"cursor: ({mouse_x}, {mouse_y})  cursor_temp: {cursor_temp:.2f} C", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"bottom_half shape: {bottom_half.shape}  dtype: {bottom_half.dtype}", (15, y0), font, fs, (200, 200, 255), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"temp_celsius shape: {temp_celsius.shape}", (15, y0), font, fs, (200, 200, 255), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"high_quality_mode: {high_quality_mode} (DDE Sharpness)", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA)
 
-        display_img = colormap
         cv2.imshow(window_name, display_img)
 
         key = cv2.waitKey(1)
@@ -943,7 +1043,7 @@ def main():
         elif key in KEY_DEBUG:
             debug_mode = not debug_mode
         elif key in KEY_SPACE:
-            frozen_frame = display_img.copy()
+            frozen_frame = colormap.copy()
             frozen = True
         elif key in KEY_SNAPSHOT:
             fn = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
@@ -1012,6 +1112,14 @@ def main():
             histogram_enabled = not histogram_enabled
         elif key in KEY_ANOMALY:
             anomaly_enabled = not anomaly_enabled
+        elif key in KEY_ARROW_LEFT:
+            rotation_deg = (rotation_deg - 90) % 360
+        elif key in KEY_ARROW_RIGHT:
+            rotation_deg = (rotation_deg + 90) % 360
+        elif key in KEY_ARROW_UP:
+            flip_v = not flip_v
+        elif key in KEY_ARROW_DOWN:
+            flip_h = not flip_h
 
     save_panel_layout(panels)
     reader.running = False

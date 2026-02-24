@@ -1,5 +1,7 @@
 # P2 Pro Thermal Camera Viewer
 
+![Demo](demo.gif)
+
 Real-time thermal imaging desktop app for the **Infiray P2 Pro** USB camera. Captures the raw YUYV stream (256×384), extracts the 256×192 thermal layer, converts to temperature, and displays with colormaps, measurement tools, and optional analysis overlays. Optimized for **macOS** (AVFoundation + ffmpeg); includes system tray and optional PyInstaller build.
 
 ---
@@ -37,6 +39,14 @@ Connect the P2 Pro; the app auto-detects it and opens the viewer. Use **I** in-a
 - **DDE – High Quality (H):** CLAHE + Lanczos upscale + unsharp mask. **[ / ]** = contrast, **-** **=** = sharpness.
 - **FPN correction:** **C** = running per-pixel calibration; **X** = one-frame reference (capture now, subtract offset; **X** again = reset).
 
+### Orientation (rotate & flip)
+
+- **Left / Right arrows** — Rotate image by 90° (0°, 90°, 180°, 270°).
+- **Up arrow** — Flip vertically (mirror top–bottom).
+- **Down arrow** — Flip horizontally (mirror left–right).
+
+Useful when the camera is mounted upside-down or sideways; all overlays and measurements follow the transformed view.
+
 ### Measurements
 
 - **Cursor** — Green crosshair + temperature at mouse position.
@@ -60,6 +70,7 @@ Connect the P2 Pro; the app auto-detects it and opens the viewer. Use **I** in-a
 
 ### Other
 
+- **Rotate & flip** — **←/→** rotate 90°; **↑** flip V, **↓** flip H (see Orientation above).
 - **Freeze (Space)** — Pause stream; snapshot and other keys still work.
 - **Snapshot (S)** — Saves `snapshot_YYYYMMDD_HHMMSS.png` (current view with overlays).
 - **Units (F)** — Toggle Celsius / Fahrenheit.
@@ -80,6 +91,7 @@ Connect the P2 Pro; the app auto-detects it and opens the viewer. Use **I** in-a
 | `requirements.txt` | Python dependencies. |
 | `Infiray P2 Pro.spec` | PyInstaller spec for macOS .app bundle. |
 | `.p2pro_layout.json` | Saved panel positions/sizes (created at runtime). |
+| `make-demo-gif.sh` | Script to build `demo.gif` from `demo.mov` (ffmpeg + gifsicle). |
 
 ---
 
