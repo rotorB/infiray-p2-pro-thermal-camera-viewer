@@ -1,0 +1,25 @@
+# Virtual env and build artifacts
+venv/
+build/
+dist/
+*.pyc
+__pycache__/
+*.pyo
+
+# Unused / large binaries
+*.pb
+FSRCNN_x3.pb
+
+# User state and captures
+.p2pro_layout.json
+snapshot_*.png
+
+# Test / dev
+test_tray.py
+test_frame.jpg
+
+# IDE / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
