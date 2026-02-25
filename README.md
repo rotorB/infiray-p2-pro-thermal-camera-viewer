@@ -10,7 +10,7 @@ Real-time thermal imaging desktop app for the **Infiray P2 Pro** USB camera. Cap
 
 - **Hardware:** Infiray P2 Pro (or compatible USB thermal camera: PureThermal, "USB Camera" with same protocol).
 - **System:** macOS (AVFoundation). **ffmpeg** must be installed (e.g. `brew install ffmpeg`).
-- **Python:** 3.8+. Dependencies: `opencv-python`, `numpy`, `pystray`, `Pillow`.
+- **Python:** 3.8+. Dependencies: `opencv-python`, `numpy`, `pystray`, `Pillow`, `pyvirtualcam` (optional, for virtual webcam).
 
 ---
 
@@ -79,6 +79,15 @@ Useful when the camera is mounted upside-down or sideways; all overlays and meas
 - **Help (I)** — Full keyboard reference.
 - **Quit (Q)** — Exits; panel layout is saved.
 - **System tray** — Menu bar icon with Quit (macOS).
+
+### Virtual webcam (U) — for messengers / streaming
+
+The **processed** thermal stream (after DDE, colormap, overlays) can be sent to a **virtual webcam** so Zoom, Teams, Telegram, OBS, etc. use it as the camera.
+
+- **U** (or toolbar **VCAM**) — Toggle virtual cam output on/off.
+- **macOS:** Install [OBS](https://obsproject.com/), then **Start Virtual Camera** in OBS (no need to add a source). The app will stream 640×480 into it; in your messenger choose **OBS Virtual Camera** as the camera.
+- **Windows:** OBS Virtual Camera or compatible virtual cam; select it in the app.
+- Requires `pip install pyvirtualcam`. If the library or OBS virtual cam is unavailable, the toggle will report an error and stay off.
 
 ---
 

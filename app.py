@@ -68,6 +68,9 @@ KEY_HISTOGRAM = {ord('b'), ord('B')}
 KEY_ANOMALY = {ord('n'), ord('N')}
 KEY_PALETTE_INVERT = {ord('z'), ord('Z')}
 KEY_DENOISE = {ord('g'), ord('G')}
+KEY_DENOISE_DOWN = {ord(','), ord('<')}
+KEY_DENOISE_UP = {ord('.'), ord('>')}
+KEY_VIRTUAL_CAM = {ord('u'), ord('U')}
 # Arrow keys: macOS 63232-63235, GTK 65361-65364, some 0-3 or 81-84
 KEY_ARROW_LEFT = {63234, 65361, 2, 84}
 KEY_ARROW_RIGHT = {63235, 65363, 3, 82}
@@ -89,9 +92,10 @@ _TOOLBAR_DEFS = [
     # Row 1: Enhancement & Control
     ('dde',     'DDE'),  ('cont_dn', 'C-'),   ('cont_up', 'C+'),
     ('shrp_dn', 'S-'),   ('shrp_up', 'S+'),   ('fpn',     'FPN'),
-    ('fpn1',    '1FPN'), ('dnz',     'DNZ'),  ('rot_l',   'RoL'),  ('rot_r',   'RoR'),
-    ('flip_v',  'FlV'),  ('flip_h',  'FlH'),  ('debug',   'DBG'),
-    ('help',    'HLP'),  ('quit',    'QUIT'),
+    ('fpn1',    '1FPN'), ('dnz',     'DNZ'),  ('dnz_dn',  'D-'),   ('dnz_up',  'D+'),
+    ('rot_l',   'RoL'),  ('rot_r',   'RoR'),
+    ('flip_v',  'FlV'),  ('flip_h',  'FlH'),  ('vcam',    'VCAM'),
+    ('debug',   'DBG'),  ('help',    'HLP'),  ('quit',    'QUIT'),
 ]
 _TB_ROW0 = 15
 
@@ -103,15 +107,16 @@ _TOOLBAR_KEY_MAP = {
     'delta': ord('v'), 'alarm': ord('a'),
     'dde': ord('h'), 'cont_dn': ord('['), 'cont_up': ord(']'),
     'shrp_dn': ord('-'), 'shrp_up': ord('='), 'fpn': ord('c'),
-    'fpn1': ord('x'), 'dnz': ord('g'), 'rot_l': 63234, 'rot_r': 63235,
-    'flip_v': 63232, 'flip_h': 63233, 'debug': ord('d'),
-    'help': ord('i'), 'quit': ord('q'),
+    'fpn1': ord('x'), 'dnz': ord('g'), 'dnz_dn': ord(','), 'dnz_up': ord('.'),
+    'rot_l': 63234, 'rot_r': 63235,
+    'flip_v': 63232, 'flip_h': 63233, 'vcam': ord('u'),
+    'debug': ord('d'), 'help': ord('i'), 'quit': ord('q'),
 }
 
 _TOOLBAR_TOGGLES = {
     'minmax', 'freeze', 'fahr', 'invert', 'roi', 'line', 'iso', 'hist',
     'trend', 'anomaly', 'delta', 'alarm', 'dde', 'fpn', 'fpn1', 'dnz',
-    'flip_v', 'flip_h', 'debug', 'help',
+    'flip_v', 'flip_h', 'vcam', 'debug', 'help',
 }
 
 
@@ -271,6 +276,13 @@ class Panel:
     def active(self):
         return self._dragging or self._resizing
 
+    def clamp(self, max_w, max_h):
+        """Constrain panel position and size to fit within display bounds."""
+        self.w = max(self.min_w, min(self.w, max_w - 4))
+        self.h = max(self.min_h, min(self.h, max_h - 4))
+        self.x = max(0, min(self.x, max_w - self.w))
+        self.y = max(0, min(self.y, max_h - self.h))
+
     def draw_frame(self, img, title_color=(0, 255, 255)):
         ih, iw = img.shape[:2]
         x1, y1 = max(0, self.x), max(0, self.y)
@@ -356,12 +368,15 @@ def save_app_settings(palette_idx, dde_clip_limit, dde_sharp_strength, dde_sharp
         pass
 
 
-def draw_line_profile(colormap, temp_celsius, start, end, scale, use_fahrenheit, panel):
-    """Draw measurement line on image and temperature profile graph in panel."""
+def draw_line_profile_markers(colormap, start, end):
+    """Draw measurement line and endpoint circles on the thermal image."""
     cv2.line(colormap, start, end, (0, 255, 255), 2, cv2.LINE_AA)
     cv2.circle(colormap, start, 5, (0, 255, 255), -1)
     cv2.circle(colormap, end, 5, (0, 255, 255), -1)
 
+
+def draw_line_profile_graph(img, temp_celsius, start, end, scale, use_fahrenheit, panel):
+    """Draw temperature profile graph in panel (on display image, rotation-independent)."""
     sx1, sy1 = start[0] // scale, start[1] // scale
     sx2, sy2 = end[0] // scale, end[1] // scale
     num_samples = max(int(np.hypot(sx2 - sx1, sy2 - sy1)), 2)
@@ -369,7 +384,7 @@ def draw_line_profile(colormap, temp_celsius, start, end, scale, use_fahrenheit,
     ys = np.clip(np.linspace(sy1, sy2, num_samples).astype(int), 0, temp_celsius.shape[0] - 1)
     temps = temp_celsius[ys, xs]
 
-    panel.draw_frame(colormap, (0, 255, 255))
+    panel.draw_frame(img, (0, 255, 255))
     cx, cy, cw, ch = panel.content_rect
     pad = 4
     gx, gy, gw, gh = cx + pad, cy + pad, cw - 2 * pad, ch - 2 * pad - 12
@@ -384,11 +399,11 @@ def draw_line_profile(colormap, temp_celsius, start, end, scale, use_fahrenheit,
     for i in range(len(temps)):
         pts[i, 0, 0] = gx + int(i / max(len(temps) - 1, 1) * gw)
         pts[i, 0, 1] = gy + gh - int((temps[i] - t_min) / (t_max - t_min) * gh)
-    cv2.polylines(colormap, [pts], False, (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.polylines(img, [pts], False, (0, 255, 255), 1, cv2.LINE_AA)
 
-    cv2.putText(colormap, format_temp(t_max, use_fahrenheit), (gx, gy + 8),
+    cv2.putText(img, format_temp(t_max, use_fahrenheit), (gx, gy + 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(colormap, format_temp(t_min, use_fahrenheit), (gx, gy + gh + 10),
+    cv2.putText(img, format_temp(t_min, use_fahrenheit), (gx, gy + gh + 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200, 200, 200), 1, cv2.LINE_AA)
 
 
@@ -419,9 +434,9 @@ def draw_isotherms(colormap, temp_celsius, range_min, range_max, scale, use_fahr
                             cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1, cv2.LINE_AA)
 
 
-def draw_trend_graph(colormap, trend_data, use_fahrenheit, panel):
+def draw_trend_graph(img, trend_data, use_fahrenheit, panel):
     """Draw cursor temperature trend in panel."""
-    panel.draw_frame(colormap, (0, 255, 0))
+    panel.draw_frame(img, (0, 255, 0))
     if len(trend_data) < 2:
         return
     cx, cy, cw, ch = panel.content_rect
@@ -440,19 +455,19 @@ def draw_trend_graph(colormap, trend_data, use_fahrenheit, panel):
     for i, t in enumerate(temps):
         pts[i, 0, 0] = gx + int(i / max(len(temps) - 1, 1) * gw)
         pts[i, 0, 1] = gy + gh - int((t - t_min) / (t_max - t_min) * gh)
-    cv2.polylines(colormap, [pts], False, (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.polylines(img, [pts], False, (0, 255, 0), 1, cv2.LINE_AA)
 
-    cv2.putText(colormap, format_temp(t_max, use_fahrenheit), (gx, gy + 8),
+    cv2.putText(img, format_temp(t_max, use_fahrenheit), (gx, gy + 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(colormap, format_temp(t_min, use_fahrenheit), (gx, gy + gh + 10),
+    cv2.putText(img, format_temp(t_min, use_fahrenheit), (gx, gy + gh + 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.28, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(colormap, format_temp(temps[-1], use_fahrenheit), (gx + gw - 35, gy + 8),
+    cv2.putText(img, format_temp(temps[-1], use_fahrenheit), (gx + gw - 35, gy + 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 255, 0), 1, cv2.LINE_AA)
 
 
-def draw_histogram(colormap, temp_celsius, use_fahrenheit, panel):
+def draw_histogram(img, temp_celsius, use_fahrenheit, panel):
     """Draw temperature distribution histogram in panel."""
-    panel.draw_frame(colormap, (200, 200, 255))
+    panel.draw_frame(img, (200, 200, 255))
     cx, cy, cw, ch = panel.content_rect
     pad = 4
     hx, hy, hw, hh = cx + pad, cy + pad, cw - 2 * pad, ch - 2 * pad - 12
@@ -475,14 +490,27 @@ def draw_histogram(colormap, temp_celsius, use_fahrenheit, panel):
         y2 = hy + hh
         t = i / num_bins
         color = (int(255 * (1 - t)), int(128 * (1 - abs(t - 0.5) * 2)), int(255 * t))
-        cv2.rectangle(colormap, (x1, y1), (x2, y2), color, -1)
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, -1)
 
-    cv2.putText(colormap, format_temp(t_min, use_fahrenheit), (hx, hy + hh + 10),
+    cv2.putText(img, format_temp(t_min, use_fahrenheit), (hx, hy + hh + 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.25, (200, 200, 200), 1, cv2.LINE_AA)
     right_label = format_temp(t_max, use_fahrenheit)
     (lw, _), _ = cv2.getTextSize(right_label, cv2.FONT_HERSHEY_SIMPLEX, 0.25, 1)
-    cv2.putText(colormap, right_label, (hx + hw - lw, hy + hh + 10),
+    cv2.putText(img, right_label, (hx + hw - lw, hy + hh + 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.25, (200, 200, 200), 1, cv2.LINE_AA)
+
+
+def draw_pin_marker(img, pos, color, pointing_up=True, size=10):
+    """Draw a compact anti-aliased triangular pin marker centered at pos."""
+    x, y = int(pos[0]), int(pos[1])
+    hs = size // 2
+    hw = hs + 1
+    if pointing_up:
+        pts = np.array([[x, y - hs], [x - hw, y + hs], [x + hw, y + hs]], dtype=np.int32)
+    else:
+        pts = np.array([[x, y + hs], [x - hw, y - hs], [x + hw, y - hs]], dtype=np.int32)
+    cv2.fillPoly(img, [pts], color, cv2.LINE_AA)
+    cv2.polylines(img, [pts], True, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def draw_anomaly_overlay(colormap, temp_celsius, sensitivity, scale, use_fahrenheit):
@@ -608,14 +636,17 @@ def main():
     roi_state = {'active': False, 'start': None, 'end': None, 'dragging': False}
     alarm_enabled = False
     alarm_threshold = 60.0  # Celsius
-    high_quality_mode = False  # 'h': DDE
+    high_quality_mode = True   # 'h': DDE, on by default
     show_controls_overlay = False  # 'i': show all keys
     palette_invert = False  # 'z': invert colormap (hot/cold swap)
     fps_times = deque(maxlen=30)  # for FPS calculation
+    virtual_cam_enabled = False  # 'u': send processed stream to virtual webcam (OBS on macOS)
+    _virtual_cam = [None]  # pyvirtualcam.Camera instance when active
+    _VCAM_SIZE = (640, 480)  # output size for messengers
     
     # DDE Parameters
-    dde_clip_limit = 3.0     # Contrast limit for CLAHE
-    dde_sharp_strength = 2.5 # Sharpness strength for Unsharp Mask
+    dde_clip_limit = 0.0     # Contrast limit for CLAHE (0 = no contrast boost)
+    dde_sharp_strength = 8.0 # Sharpness strength for Unsharp Mask
     dde_sharp_sigma = 1.2    # Sharpness radius
 
     # FPN (fixed-pattern noise) correction: running per-pixel calibration
@@ -740,12 +771,12 @@ def main():
             if trend_enabled:
                 visible.append(panels['trend'])
             for p in visible:
-                if p.hit_grip(mouse_x, mouse_y):
-                    p.start_resize(mouse_x, mouse_y)
+                if p.hit_grip(x, y):
+                    p.start_resize(x, y)
                     _panel_drag['ref'] = p
                     return
-                if p.hit_title(mouse_x, mouse_y):
-                    p.start_drag(mouse_x, mouse_y)
+                if p.hit_title(x, y):
+                    p.start_drag(x, y)
                     _panel_drag['ref'] = p
                     return
             if line_profile_mode:
@@ -760,7 +791,7 @@ def main():
         elif event == cv2.EVENT_MOUSEMOVE:
             ap = _panel_drag['ref']
             if ap and ap.active:
-                ap.on_move(mouse_x, mouse_y, WIDTH, HEIGHT)
+                ap.on_move(x, y, _tb_display_dims[0], _tb_display_dims[1])
                 return
             if line_profile.get('dragging'):
                 line_profile['end'] = (mouse_x, mouse_y)
@@ -839,6 +870,12 @@ def main():
                 cv2.putText(display_frozen, "Q - Quit   P - Next palette   M - Min/Max   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_frozen, "SPACE - Resume   S - Snapshot   F - C/F", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_frozen, "1-9 - Palette   0 - Range   R - ROI   A - Alarm   H - DDE   [ ] = - DDE   I - Help", (20, y0), font, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+            if virtual_cam_enabled and _virtual_cam[0] is not None:
+                try:
+                    vframe = cv2.resize(display_frozen, _VCAM_SIZE, interpolation=cv2.INTER_LINEAR)
+                    _virtual_cam[0].send(cv2.cvtColor(vframe, cv2.COLOR_BGR2RGB))
+                except Exception:
+                    pass
             _tb_display_dims[0], _tb_display_dims[1] = df_w, df_h
             frozen_tb_states = {
                 'minmax': show_min_max, 'freeze': True, 'fahr': use_fahrenheit,
@@ -848,8 +885,8 @@ def main():
                 'delta': delta_t_enabled, 'alarm': alarm_enabled,
                 'dde': high_quality_mode, 'fpn': fpn_enabled,
                 'fpn1': single_frame_fpn_enabled, 'dnz': denoise_enabled,
-                'flip_v': flip_v,
-                'flip_h': flip_h, 'debug': debug_mode, 'help': show_controls_overlay,
+                'flip_v': flip_v, 'flip_h': flip_h, 'vcam': virtual_cam_enabled,
+                'debug': debug_mode, 'help': show_controls_overlay,
             }
             ftb = np.zeros((TOOLBAR_H, df_w, 3), dtype=np.uint8)
             display_frozen = np.vstack([display_frozen, ftb])
@@ -901,8 +938,20 @@ def main():
                 denoise_enabled = not denoise_enabled
                 if not denoise_enabled:
                     denoiser.reset()
+            elif key in KEY_DENOISE_DOWN:
+                denoiser.adjust(-denoiser.STRENGTH_STEP)
+            elif key in KEY_DENOISE_UP:
+                denoiser.adjust(denoiser.STRENGTH_STEP)
             elif key in KEY_HELP:
                 show_controls_overlay = not show_controls_overlay
+            elif key in KEY_VIRTUAL_CAM:
+                virtual_cam_enabled = not virtual_cam_enabled
+                if not virtual_cam_enabled and _virtual_cam[0] is not None:
+                    try:
+                        _virtual_cam[0].close()
+                    except Exception:
+                        pass
+                    _virtual_cam[0] = None
             elif key in KEY_PALETTE_INVERT:
                 palette_invert = not palette_invert
             elif key in KEY_SNAPSHOT:
@@ -1021,10 +1070,9 @@ def main():
         else:
             cursor_temp = 0.0
         
-        # Draw min/max markers only when enabled (markers on colormap; labels drawn on display later)
         if show_min_max:
-            cv2.drawMarker(colormap, (min_x, min_y), (255, 100, 0), cv2.MARKER_TRIANGLE_DOWN, 24, 2)  # blue = min
-            cv2.drawMarker(colormap, (max_x, max_y), (0, 0, 255), cv2.MARKER_TRIANGLE_UP, 24, 2)   # red = max
+            draw_pin_marker(colormap, (min_x, min_y), (255, 140, 40), pointing_up=False, size=10)
+            draw_pin_marker(colormap, (max_x, max_y), (40, 60, 255), pointing_up=True, size=10)
         
         if trend_enabled:
             trend_data.append(cursor_temp)
@@ -1069,16 +1117,22 @@ def main():
             if line_profile.get('dragging'):
                 cv2.line(colormap, line_profile['start'], line_profile['end'], (0, 255, 255), 2, cv2.LINE_AA)
             else:
-                draw_line_profile(colormap, temp_celsius, line_profile['start'], line_profile['end'], SCALE, use_fahrenheit, panels['line_profile'])
-
-        if trend_enabled:
-            draw_trend_graph(colormap, trend_data, use_fahrenheit, panels['trend'])
-
-        if histogram_enabled:
-            draw_histogram(colormap, temp_celsius, use_fahrenheit, panels['histogram'])
+                draw_line_profile_markers(colormap, line_profile['start'], line_profile['end'])
 
         display_img = apply_rotate_flip(colormap)
         dh, dw = display_img.shape[:2]
+
+        for p in panels.values():
+            p.clamp(dw, dh)
+
+        if line_profile_mode and line_profile['start'] and line_profile['end'] and not line_profile.get('dragging'):
+            draw_line_profile_graph(display_img, temp_celsius, line_profile['start'], line_profile['end'], SCALE, use_fahrenheit, panels['line_profile'])
+
+        if trend_enabled:
+            draw_trend_graph(display_img, trend_data, use_fahrenheit, panels['trend'])
+
+        if histogram_enabled:
+            draw_histogram(display_img, temp_celsius, use_fahrenheit, panels['histogram'])
 
         # --- All text/overlay drawn on display_img in SCREEN coords (always readable, fixed positions) ---
 
@@ -1088,14 +1142,13 @@ def main():
         cv2.putText(display_img, cursor_label, (cmx + 10, cmy - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
-        # Min/Max labels follow their markers in screen space
         if show_min_max:
             dmn = logical_to_display(min_x, min_y)
             cv2.putText(display_img, f"MIN {format_temp(min_temp, use_fahrenheit)}",
-                        (dmn[0] + 12, dmn[1] + 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2, cv2.LINE_AA)
+                        (dmn[0] + 8, dmn[1] + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 100), 1, cv2.LINE_AA)
             dmx = logical_to_display(max_x, max_y)
             cv2.putText(display_img, f"MAX {format_temp(max_temp, use_fahrenheit)}",
-                        (dmx[0] + 12, dmx[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2, cv2.LINE_AA)
+                        (dmx[0] + 8, dmx[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 255), 1, cv2.LINE_AA)
 
         # ROI label follows ROI in screen space
         if roi_state['start'] and roi_state['end']:
@@ -1118,25 +1171,14 @@ def main():
             d_min, d_max = float(np.min(delta_display)), float(np.max(delta_display))
             cv2.putText(display_img, f"DELTA-T: {d_min:+.1f} to {d_max:+.1f} C  (V to reset)", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
-        else:
-            cv2.putText(display_img, f"Min: {format_temp(min_temp, use_fahrenheit)}  Max: {format_temp(max_temp, use_fahrenheit)}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
         if alarm_enabled and max_temp >= alarm_threshold:
             cv2.putText(display_img, f" HOT! {format_temp(max_temp, use_fahrenheit)} ", (dw // 2 - 80, dh // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA)
 
-        cv2.putText(display_img, f"Palette: {palette_name}{' [inv]' if palette_invert else ''} (1-9,P,Z) | Range: {'Auto' if range_preset == 0 else 'Room' if range_preset == 1 else 'Wide'} (0)",
-                    (10, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
         if high_quality_mode:
             cv2.putText(display_img, f" HQ (H) | Cont: {dde_clip_limit:.1f} | Shrp: {dde_sharp_strength:.1f} ",
                         (dw - 280, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 1, cv2.LINE_AA)
-        if roi_state['active']:
-            cv2.putText(display_img, "ROI: drag (R cancel)", (10, dh - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
-        elif line_profile_mode:
-            cv2.putText(display_img, "LINE: drag to draw (L cancel)", (10, dh - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1, cv2.LINE_AA)
 
         (fw, _), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, fps_scale, 1)
         d_fps_x = dw - fw - 10
@@ -1151,8 +1193,9 @@ def main():
             cv2.putText(display_img, " FPN (C) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (0, 255, 200), 1, cv2.LINE_AA)
             status_right -= sw + 8
         if denoise_enabled:
-            (sw, _), _ = cv2.getTextSize(" DNZ (G) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
-            cv2.putText(display_img, " DNZ (G) ", (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (100, 200, 255), 1, cv2.LINE_AA)
+            dnz_label = f" DNZ {denoiser.strength:.1f} (G ,.) "
+            (sw, _), _ = cv2.getTextSize(dnz_label, cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
+            cv2.putText(display_img, dnz_label, (status_right - sw, dh - 12), cv2.FONT_HERSHEY_SIMPLEX, status_scale, (100, 200, 255), 1, cv2.LINE_AA)
             status_right -= sw + 8
         if delta_t_enabled:
             (sw, _), _ = cv2.getTextSize(" Delta-T (V) ", cv2.FONT_HERSHEY_SIMPLEX, status_scale, 1)
@@ -1181,10 +1224,11 @@ def main():
             cv2.putText(display_img, "[ ] - DDE Contrast less/more   - = - Sharpness less/more", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "C - FPN correction (running calibration)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "X - One-frame FPN: capture current frame, apply to all; X again = reset", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(display_img, "G - De-noise: temporal averaging + bilateral filter (matrix noise)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "G - De-noise (NLM)   < > (or , .) - denoise strength", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "L - Line profile   T - Isotherms   V - Delta-T mode", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "W - Temp trend   B - Histogram   N - Anomaly detection", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "Left/Right - Rotate 90 deg   Up/Down - Flip V/H", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, "U - Virtual webcam (OBS) for Zoom/Telegram/Teams", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, "I - Show/hide this help", (20, y0), font, fs, (200, 255, 200), 1)
 
         if debug_mode:
@@ -1210,6 +1254,28 @@ def main():
             cv2.putText(display_img, f"temp_celsius shape: {temp_celsius.shape}", (15, y0), font, fs, (200, 200, 255), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"high_quality_mode: {high_quality_mode} (DDE Sharpness)", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA)
 
+        if virtual_cam_enabled:
+            if _virtual_cam[0] is None:
+                try:
+                    import pyvirtualcam
+                    _virtual_cam[0] = pyvirtualcam.Camera(_VCAM_SIZE[0], _VCAM_SIZE[1], fps=25)
+                    print("Virtual cam: streaming to OBS Virtual Camera (640x480)")
+                except Exception as e:
+                    print("Virtual cam: failed.", e)
+                    print("  -> macOS: install OBS, then in OBS use Tools -> Start Virtual Camera (once), then press U again.")
+                    virtual_cam_enabled = False
+            if _virtual_cam[0] is not None:
+                try:
+                    vframe = cv2.resize(display_img, _VCAM_SIZE, interpolation=cv2.INTER_LINEAR)
+                    _virtual_cam[0].send(cv2.cvtColor(vframe, cv2.COLOR_BGR2RGB))
+                except Exception:
+                    try:
+                        _virtual_cam[0].close()
+                    except Exception:
+                        pass
+                    _virtual_cam[0] = None
+                    virtual_cam_enabled = False
+
         _tb_display_dims[0], _tb_display_dims[1] = dw, dh
         tb_states = {
             'minmax': show_min_max, 'freeze': frozen, 'fahr': use_fahrenheit,
@@ -1219,8 +1285,8 @@ def main():
             'delta': delta_t_enabled, 'alarm': alarm_enabled,
             'dde': high_quality_mode, 'fpn': fpn_enabled,
             'fpn1': single_frame_fpn_enabled, 'dnz': denoise_enabled,
-            'flip_v': flip_v,
-            'flip_h': flip_h, 'debug': debug_mode, 'help': show_controls_overlay,
+            'flip_v': flip_v, 'flip_h': flip_h, 'vcam': virtual_cam_enabled,
+            'debug': debug_mode, 'help': show_controls_overlay,
         }
         tb_strip = np.zeros((TOOLBAR_H, dw, 3), dtype=np.uint8)
         display_img = np.vstack([display_img, tb_strip])
@@ -1299,6 +1365,14 @@ def main():
             dde_sharp_strength += 0.5
         elif key in KEY_HELP:
             show_controls_overlay = not show_controls_overlay
+        elif key in KEY_VIRTUAL_CAM:
+            virtual_cam_enabled = not virtual_cam_enabled
+            if not virtual_cam_enabled and _virtual_cam[0] is not None:
+                try:
+                    _virtual_cam[0].close()
+                except Exception:
+                    pass
+                _virtual_cam[0] = None
         elif key in KEY_FPN:
             fpn_enabled = not fpn_enabled
             if not fpn_enabled:
@@ -1342,6 +1416,10 @@ def main():
             denoise_enabled = not denoise_enabled
             if not denoise_enabled:
                 denoiser.reset()
+        elif key in KEY_DENOISE_DOWN:
+            denoiser.adjust(-denoiser.STRENGTH_STEP)
+        elif key in KEY_DENOISE_UP:
+            denoiser.adjust(denoiser.STRENGTH_STEP)
         elif key in KEY_ARROW_LEFT:
             rotation_deg = (rotation_deg - 90) % 360
         elif key in KEY_ARROW_RIGHT:

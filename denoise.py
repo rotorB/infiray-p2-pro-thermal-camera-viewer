@@ -1,12 +1,15 @@
 """
 Thermal matrix de-noise for microbolometer cameras (e.g. Infiray P2 Pro).
 
-Combines temporal averaging (exponential moving average across frames)
-with edge-preserving spatial filtering (bilateral filter) to suppress
-random noise and row/column artifacts while retaining thermal detail.
+Two-stage pipeline:
+  1. Temporal EMA — averages consecutive frames to cancel random per-pixel
+     fluctuations.  Zero spatial blur.
+  2. Spatial Non-Local Means (NLM) — finds similar patches across the image
+     and averages only those, preserving edges far better than Gaussian or
+     bilateral filters.  Kicks in only above strength 1.5.
 
 Applied on float64 temperature array (Celsius) after conversion, before
-normalization to 8-bit.
+normalization to 8-bit.  Single "strength" knob (1..10) controls both stages.
 """
 
 import cv2
@@ -15,66 +18,81 @@ import numpy as np
 
 class ThermalDenoiser:
     """
-    Two-stage denoiser: temporal EMA + spatial bilateral filter.
+    Adjustable two-stage denoiser: temporal EMA + spatial NLM.
 
-    Temporal stage smooths per-pixel random fluctuations across frames.
-    Spatial stage removes residual salt-and-pepper and matrix grid noise
-    while preserving object edges.
+    strength (1..10):
+      1   — almost pass-through (very light temporal only)
+      3   — default: mild temporal + light NLM
+      5   — moderate
+      10  — heavy smoothing (static scenes)
     """
 
-    def __init__(self, shape, temporal_alpha=0.75, spatial_d=3,
-                 spatial_sigma_color=0.8, spatial_sigma_space=0.8):
-        """
-        Args:
-            shape: (height, width) of the temperature array.
-            temporal_alpha: weight of new frame in EMA (0..1).
-                0.75 = light smoothing (~2 frames), 0.3 = heavy (~5-6 frames).
-            spatial_d: bilateral filter diameter (pixels). 3 = minimal footprint.
-            spatial_sigma_color: bilateral color (temperature) sigma in Celsius.
-                Lower = only smooth very similar temps, preserving all detail.
-            spatial_sigma_space: bilateral spatial sigma in pixels.
-        """
+    STRENGTH_MIN = 1.0
+    STRENGTH_MAX = 10.0
+    STRENGTH_STEP = 0.5
+    STRENGTH_DEFAULT = 3.0
+
+    NLM_TEMPLATE = 7
+    NLM_SEARCH = 21
+
+    def __init__(self, shape):
         self.shape = shape
-        self.temporal_alpha = temporal_alpha
-        self.spatial_d = spatial_d
-        self.spatial_sigma_color = spatial_sigma_color
-        self.spatial_sigma_space = spatial_sigma_space
+        self.strength = self.STRENGTH_DEFAULT
         self._accum = None
 
     def reset(self):
-        """Discard temporal history (e.g. after scene change)."""
+        """Discard temporal history."""
         self._accum = None
+
+    @property
+    def _temporal_alpha(self):
+        """Weight of new frame in EMA.  Lower = heavier averaging."""
+        return max(0.25, 1.0 - self.strength * 0.07)
+
+    @property
+    def _nlm_h(self):
+        """NLM filter strength in uint8 space.  0 = spatial stage off."""
+        return max(0.0, (self.strength - 1.5) * 1.5)
+
+    def adjust(self, delta):
+        """Change strength by delta, clamping to valid range."""
+        self.strength = round(
+            max(self.STRENGTH_MIN,
+                min(self.STRENGTH_MAX, self.strength + delta)),
+            1,
+        )
 
     def apply(self, temp_celsius: np.ndarray) -> np.ndarray:
         """
-        Denoise a temperature frame.
-
-        Args:
-            temp_celsius: float64 array (H, W) of temperatures in Celsius.
-
-        Returns:
-            Denoised float64 array, same shape.
+        Denoise a single temperature frame (float64, H×W).
+        Returns denoised float64 array, same shape.
         """
         frame = np.asarray(temp_celsius, dtype=np.float64)
         if frame.shape != self.shape:
             return frame
 
-        # --- Temporal: exponential moving average ---
+        # --- Stage 1: temporal EMA ---
+        alpha = self._temporal_alpha
         if self._accum is None:
             self._accum = frame.copy()
         else:
-            a = self.temporal_alpha
-            self._accum = a * frame + (1.0 - a) * self._accum
+            self._accum = alpha * frame + (1.0 - alpha) * self._accum
 
-        smoothed = self._accum
+        result = self._accum
 
-        # --- Spatial: bilateral filter (edge-preserving) ---
-        # cv2.bilateralFilter needs 8-bit or 32-bit float input
-        f32 = smoothed.astype(np.float32)
-        filtered = cv2.bilateralFilter(
-            f32, self.spatial_d,
-            self.spatial_sigma_color,
-            self.spatial_sigma_space,
-        )
+        # --- Stage 2: spatial NLM (only when strength > ~1.5) ---
+        h = self._nlm_h
+        if h > 0.1:
+            t_min = np.min(result)
+            t_range = max(np.ptp(result), 0.01)
+            norm = ((result - t_min) / t_range * 255.0)
+            norm = np.clip(norm, 0, 255).astype(np.uint8)
 
-        return filtered.astype(np.float64)
+            denoised = cv2.fastNlMeansDenoising(
+                norm, None, h,
+                self.NLM_TEMPLATE, self.NLM_SEARCH,
+            )
+
+            result = denoised.astype(np.float64) / 255.0 * t_range + t_min
+
+        return result
