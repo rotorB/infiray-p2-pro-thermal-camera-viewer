@@ -32,12 +32,15 @@ Connect the P2 Pro; the app auto-detects it and opens the viewer. Use **I** in-a
 - **Live thermal stream** — 256×192 thermal data, 3× upscale to 768×576, 25 FPS.
 - **Temperature** — Raw 16-bit → Celsius (formula: `/64 - 273.15`), clip -20…150°C for display.
 - **Range presets (0):** Auto (frame min–max), Room (15–35°C), Wide (-20–150°C).
-- **Palettes (P, 1–9):** Inferno, Jet, Hot, Plasma, Magma, Viridis, Rainbow, Bone, Ocean.
+- **Palettes:** **P** — cycle through all; **1–9** — jump to palettes 1–9; **! @ # $ % ^ &** (Shift+1…7) — jump to palettes 10–16.
 
 ### Image quality
 
 - **DDE – High Quality (H):** CLAHE + Lanczos upscale + unsharp mask. **[ / ]** = contrast, **-** **=** = sharpness.
+- **IBP upscale (Y):** Iterative Back-Projection — training-free refinement; **J** / **K** = strength 1–10.
+- **Burst SR (E):** Multi-frame super-resolution from subpixel shifts (Samsung-style): buffers frames, estimates shift via phase correlation, fuses to HR. Slight camera/scene motion improves result.
 - **FPN correction:** **C** = running per-pixel calibration; **X** = one-frame reference (capture now, subtract offset; **X** again = reset).
+- **De-noise (G):** NLM + temporal smoothing. **,** **.** = strength.
 
 ### Orientation (rotate & flip)
 
