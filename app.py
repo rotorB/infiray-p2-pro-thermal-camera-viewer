@@ -290,6 +290,21 @@ def unsharp_mask(img_uint8, sigma=1.0, strength=1.5):
     sharp = cv2.addWeighted(img_uint8, 1.0 + strength, blurred, -strength, 0)
     return np.clip(sharp, 0, 255).astype(np.uint8)
 
+
+def compute_fps(fps_times):
+    """Frames/sec from timestamps of *completed* frames.
+
+    With times t0..t_{n-1} there are (n-1) intervals, so FPS = (n-1)/(t_last-t_first).
+    Using n/elapsed systematically overestimates (e.g. 30 samples @ 25 Hz → ~25.9).
+    """
+    if len(fps_times) < 2:
+        return 0.0
+    elapsed = fps_times[-1] - fps_times[0]
+    if elapsed <= 0:
+        return 0.0
+    return (len(fps_times) - 1) / elapsed
+
+
 def _read_exact(stream, size):
     """Read exactly `size` bytes; return bytes or empty if EOF/closed."""
     buf = b''
@@ -626,12 +641,19 @@ def draw_anomaly_overlay(colormap, temp_celsius, sensitivity, scale, use_fahrenh
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
 
 
+FRAME_W, FRAME_H = 256, 384
+FRAME_SIZE = FRAME_W * FRAME_H * 2  # YUYV: 2 bytes/pixel
+RECONNECT_INTERVAL_S = 1.0
+STALL_TIMEOUT_S = 2.0
+
+
 class FrameReader(threading.Thread):
     def __init__(self, process, frame_size):
         super().__init__()
         self.process = process
         self.frame_size = frame_size
         self.latest_frame = None
+        self.last_frame_time = 0.0  # monotonic time of last full frame
         self.running = True
         self.lock = threading.Lock()
         self.daemon = True
@@ -648,30 +670,32 @@ class FrameReader(threading.Thread):
                 while select.select([stdout], [], [], 0)[0]:
                     next_bytes = _read_exact(stdout, self.frame_size)
                     if len(next_bytes) != self.frame_size:
+                        self.running = False
                         break
                     raw_bytes = next_bytes
             except (ValueError, OSError):
                 pass  # select on closed fd or unsupported
+            if not self.running:
+                break
             with self.lock:
                 self.latest_frame = raw_bytes
+                self.last_frame_time = time.monotonic()
 
     def get_latest_frame(self):
         with self.lock:
             return self.latest_frame
 
-def main():
-    print("Searching for Infiray P2 Pro via ffmpeg...")
-    cam_index = get_camera_index()
-    
-    if cam_index is None:
-        print("Infiray P2 Pro not found. Make sure it's plugged in.")
-        sys.exit(1)
-        
-    print(f"Found P2 Pro at AVFoundation index {cam_index}")
-    
-    # Command to capture raw YUYV stream
-    # Added -fflags nobuffer and -flags low_delay to remove latency
-    command = [
+    def seconds_since_frame(self):
+        with self.lock:
+            t = self.last_frame_time
+        if t <= 0:
+            return None
+        return time.monotonic() - t
+
+
+def _ffmpeg_capture_command(cam_index):
+    # -fflags nobuffer / -flags low_delay: minimize latency
+    return [
         FFMPEG_PATH,
         '-hide_banner',
         '-loglevel', 'error',
@@ -679,23 +703,71 @@ def main():
         '-flags', 'low_delay',
         '-f', 'avfoundation',
         '-framerate', '25',
-        '-video_size', '256x384',
+        '-video_size', f'{FRAME_W}x{FRAME_H}',
         '-pix_fmt', 'yuyv422',
         '-i', str(cam_index),
         '-f', 'rawvideo',
         '-pix_fmt', 'yuyv422',
-        '-'
+        '-',
     ]
-    
-    frame_size = 256 * 384 * 2  # 256x384 resolution, 2 bytes per pixel (YUYV)
-    # One-frame buffer; reader drains pipe to latest frame for real-time
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=frame_size)
 
-    # Start background thread to continuously read frames and drop old ones
-    reader = FrameReader(process, frame_size)
+
+def start_thermal_capture(cam_index=None):
+    """Open P2 Pro via ffmpeg. Returns (process, reader, cam_index) or (None, None, None)."""
+    if cam_index is None:
+        cam_index = get_camera_index()
+    if cam_index is None:
+        return None, None, None
+    process = subprocess.Popen(
+        _ffmpeg_capture_command(cam_index),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=FRAME_SIZE,
+    )
+    reader = FrameReader(process, FRAME_SIZE)
     reader.start()
+    return process, reader, cam_index
 
-    print("Starting video stream.")
+
+def stop_thermal_capture(process, reader):
+    """Stop FrameReader and terminate ffmpeg (best-effort)."""
+    if reader is not None:
+        reader.running = False
+    if process is not None:
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1.0)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            if process.stdout:
+                process.stdout.close()
+        except Exception:
+            pass
+    if reader is not None:
+        reader.join(timeout=1.0)
+
+
+def main():
+    # Prefer SIMD OpenCV paths when available
+    cv2.setUseOptimized(True)
+
+    print("Searching for Infiray P2 Pro via ffmpeg...")
+    process, reader, cam_index = start_thermal_capture()
+
+    if process is None:
+        print("Infiray P2 Pro not found — will keep trying. Plug it in or press Q to quit.")
+    else:
+        print(f"Found P2 Pro at AVFoundation index {cam_index}")
+        print("Starting video stream.")
     print("Controls:")
     print("  'q' - Quit   'p' - Next Palette   'm' - Min/Max pointers   'd' - Debug")
     print("  SPACE - Freeze frame   's' - Snapshot   'f' - Celsius/Fahrenheit")
@@ -729,9 +801,14 @@ def main():
     high_quality_mode = True   # 'h': DDE, on by default
     show_controls_overlay = False  # 'i': show all keys
     palette_invert = False  # 'z': invert colormap (hot/cold swap)
-    fps_times = deque(maxlen=30)  # for FPS calculation
+    fps_times = deque(maxlen=60)  # ~1–2 s window at 25–60 FPS; compute_fps uses (n-1)/dt
+    last_seen_raw_bytes = None    # skip reprocessing / FPS inflation on duplicate frames
+    _clahe = None                 # reused CLAHE (recreated when clip limit changes)
+    _clahe_clip = None
+    _ui_canvas = None             # reusable image+status+toolbar buffer (avoids vstack alloc)
     virtual_cam_enabled = False  # 'u': send processed stream to virtual webcam (OBS on macOS)
     _virtual_cam = [None]  # pyvirtualcam.Camera instance when active
+    _vcam_send_count = [0]  # for debug: frames sent to virtual cam
     _VCAM_SIZE = (640, 480)  # output size for messengers
     
     # DDE Parameters
@@ -780,7 +857,11 @@ def main():
     flip_v = False
 
     def apply_rotate_flip(img):
-        out = img.copy()
+        # Identity still copies once (HUD draws on the result without touching source).
+        # With rotation/flip, OpenCV already allocates — skip the extra upfront copy.
+        if rotation_deg == 0 and not flip_h and not flip_v:
+            return img.copy()
+        out = img
         if flip_v:
             out = cv2.flip(out, 0)
         if flip_h:
@@ -961,7 +1042,75 @@ def main():
     ))
     tray_icon.run_detached()
 
-    while reader.running and running:
+    reconnecting = process is None
+    reconnect_attempt = 0
+    last_reconnect_try = 0.0
+    capture_started_at = time.monotonic() if process is not None else 0.0
+    last_display_img = None  # last live frame for reconnect overlay
+
+    while running:
+        # --- Auto-reconnect: EOF/dead reader or stalled stream ---
+        stream_dead = reader is None or not reader.running
+        stalled = False
+        if reader is not None and reader.running:
+            age = reader.seconds_since_frame()
+            if age is not None and age > STALL_TIMEOUT_S:
+                stalled = True
+            elif age is None and capture_started_at > 0 and (time.monotonic() - capture_started_at) > STALL_TIMEOUT_S:
+                # Opened but never delivered a frame
+                stalled = True
+
+        if stream_dead or stalled:
+            if not reconnecting or stalled:
+                reason = "stalled (no frames)" if stalled else "disconnected"
+                print(f"Camera {reason} — reconnecting...")
+            if reader is not None or process is not None:
+                stop_thermal_capture(process, reader)
+                process, reader = None, None
+            reconnecting = True
+            capture_started_at = 0.0
+
+        if reconnecting:
+            now = time.monotonic()
+            if process is None and now - last_reconnect_try >= RECONNECT_INTERVAL_S:
+                last_reconnect_try = now
+                reconnect_attempt += 1
+                process, reader, cam_index = start_thermal_capture()
+                if process is not None:
+                    capture_started_at = time.monotonic()
+                    print(f"Camera found (index {cam_index}), waiting for frames...")
+
+            # Overlay on last frame (or black placeholder)
+            if last_display_img is not None:
+                recon_img = last_display_img.copy()
+            elif frozen and frozen_frame is not None:
+                recon_img = apply_rotate_flip(frozen_frame.copy())
+            else:
+                recon_img = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+            rh, rw = recon_img.shape[:2]
+            dim = recon_img.copy()
+            cv2.rectangle(dim, (0, 0), (rw, rh), (20, 20, 20), -1)
+            cv2.addWeighted(dim, 0.55, recon_img, 0.45, 0, recon_img)
+            msg = f"Reconnecting... (attempt {reconnect_attempt})"
+            (tw, th), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.putText(recon_img, msg, ((rw - tw) // 2, rh // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
+            cv2.putText(recon_img, "Q to quit", ((rw - 80) // 2, rh // 2 + 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.imshow(window_name, recon_img)
+            key = cv2.waitKey(50) & 0xFFFF
+            if window_closed() or key in KEY_QUIT:
+                break
+
+            # Cleared only after a real frame is available
+            if reader is not None and reader.get_latest_frame() is not None:
+                print("Camera reconnected.")
+                reconnecting = False
+                reconnect_attempt = 0
+                # Fall through to normal frame path this iteration
+            else:
+                continue
+
         if frozen and frozen_frame is not None:
             display_frozen = apply_rotate_flip(frozen_frame.copy())
             df_h, df_w = display_frozen.shape[:2]
@@ -981,8 +1130,9 @@ def main():
                 try:
                     vframe = cv2.resize(display_frozen, _VCAM_SIZE, interpolation=cv2.INTER_LINEAR)
                     _virtual_cam[0].send(cv2.cvtColor(vframe, cv2.COLOR_BGR2RGB))
-                except Exception:
-                    pass
+                    _vcam_send_count[0] += 1
+                except Exception as e:
+                    print("VCAM send (frozen) failed:", e)
             _tb_display_dims[0], _tb_display_dims[1] = df_w, df_h
             cont_label = "Off" if contrast_mode == 'off' or dde_clip_limit <= 0 else ("CLAHE" if contrast_mode == 'clahe' else contrast_mode.capitalize())
             frozen_status_state = {
@@ -1014,6 +1164,7 @@ def main():
             ftb = np.zeros((TOOLBAR_H, df_w, 3), dtype=np.uint8)
             display_frozen = np.vstack([display_frozen, ftb])
             draw_toolbar(display_frozen, df_h + STATUS_BAR_H, df_w, frozen_tb_states, _tb_hover_id[0])
+            last_display_img = display_frozen
             cv2.imshow(window_name, display_frozen)
             key = cv2.waitKey(1)
             if window_closed():
@@ -1145,67 +1296,78 @@ def main():
                 rgb_aligner.set_zoom(rgb_aligner.get_zoom() + 0.05)
             continue
 
+        if reader is None:
+            reconnecting = True
+            continue
+
         raw_bytes = reader.get_latest_frame()
         if raw_bytes is None:
-            cv2.waitKey(10)
+            cv2.waitKey(1)
             continue
+
+        # Same buffer as last iteration → camera has not produced a new frame yet.
+        # Do not reprocess (wastes CPU) or count toward FPS (would inflate the counter).
+        if raw_bytes is last_seen_raw_bytes:
+            cv2.waitKey(1)
+            continue
+        last_seen_raw_bytes = raw_bytes
 
         frame_count += 1
         fps_times.append(time.perf_counter())
 
-        # Convert bottom half to 16-bit array
-        bottom_half_bytes = raw_bytes[256*192*2:]
+        # Convert bottom half to 16-bit array (one copy; last_raw shares until FPN reassigns)
+        bottom_half_bytes = raw_bytes[256 * 192 * 2:]
         bottom_half = np.frombuffer(bottom_half_bytes, dtype=np.uint16).reshape((192, 256)).copy()
-        last_raw_bottom_half = bottom_half.copy()
+        last_raw_bottom_half = bottom_half
 
         # One-frame FPN: subtract offset from captured frame (X) to all frames
         if single_frame_fpn_enabled and single_frame_offset_map is not None:
             bottom_half = np.clip(
-                bottom_half.astype(np.float64) - single_frame_offset_map, 0, 65535
+                bottom_half.astype(np.float32) - single_frame_offset_map, 0, 65535
             ).astype(np.uint16)
 
         # Running FPN correction (removes fixed per-pixel offset pattern over time)
         if fpn_enabled:
             bottom_half = fpn_corrector.apply(bottom_half)
 
-        # Calculate temperature
-        temp_celsius = (bottom_half / 64.0) - 273.15
-        raw_min_c, raw_max_c = np.min(temp_celsius), np.max(temp_celsius)
+        # Calculate temperature (float32 is enough and faster than float64)
+        temp_celsius = bottom_half.astype(np.float32) * (1.0 / 64.0) - np.float32(273.15)
+        raw_min_c = float(temp_celsius.min())
+        raw_max_c = float(temp_celsius.max())
         # Filter out obvious outliers
         temp_celsius = np.clip(temp_celsius, -20, 150)
 
         # Temporal + spatial de-noise (G)
         if denoise_enabled:
             temp_celsius = denoiser.apply(temp_celsius)
-        
-        # Calculate min/max on the original 256x192 array for accuracy and speed
-        min_temp = np.min(temp_celsius)
-        max_temp = np.max(temp_celsius)
+
+        # Min/max in two passes (argmin/argmax) instead of four (min+max+argmin+argmax)
+        min_flat = int(temp_celsius.argmin())
+        max_flat = int(temp_celsius.argmax())
+        min_temp = float(temp_celsius.flat[min_flat])
+        max_temp = float(temp_celsius.flat[max_flat])
         if range_preset == 1:
             range_min, range_max = 15.0, 35.0
         elif range_preset == 2:
             range_min, range_max = -20.0, 150.0
         else:
             range_min, range_max = min_temp, max_temp
-        
-        # Find pixel coordinates of min and max
-        min_flat = np.argmin(temp_celsius)
-        max_flat = np.argmax(temp_celsius)
-        min_pt = np.unravel_index(min_flat, temp_celsius.shape)  # (y, x)
-        max_pt = np.unravel_index(max_flat, temp_celsius.shape)  # (y, x)
-        min_x, min_y = min_pt[1] * SCALE, min_pt[0] * SCALE
-        max_x, max_y = max_pt[1] * SCALE, max_pt[0] * SCALE
-        
+
+        min_y, min_x = divmod(min_flat, temp_celsius.shape[1])
+        max_y, max_x = divmod(max_flat, temp_celsius.shape[1])
+        min_x, min_y = min_x * SCALE, min_y * SCALE
+        max_x, max_y = max_x * SCALE, max_y * SCALE
+
         # Normalize to 8-bit BEFORE upscaling
         delta_display = None
         if delta_t_enabled and delta_t_reference is not None:
             delta_display = temp_celsius - delta_t_reference
-            abs_range = max(abs(float(np.min(delta_display))), abs(float(np.max(delta_display))), 0.1)
+            abs_range = max(abs(float(delta_display.min())), abs(float(delta_display.max())), 0.1)
             normalized_small = ((delta_display + abs_range) / (2 * abs_range) * 255).astype(np.uint8)
-            normalized_small = np.clip(normalized_small, 0, 255)
         elif range_max > range_min:
-            normalized_small = ((temp_celsius - range_min) / (range_max - range_min) * 255).astype(np.uint8)
-            normalized_small = np.clip(normalized_small, 0, 255)
+            normalized_small = (
+                (temp_celsius - range_min) * (np.float32(255.0) / np.float32(range_max - range_min))
+            ).astype(np.uint8)
         else:
             normalized_small = np.zeros_like(temp_celsius, dtype=np.uint8)
 
@@ -1214,7 +1376,7 @@ def main():
             # DDE (Digital Detail Enhancement) for Thermal Images
             # 1. Contrast: gamma (global), percentile (global), or CLAHE (local)
             if dde_clip_limit > 0 and contrast_mode != 'off':
-                x = normalized_small.astype(np.float64) / 255.0
+                x = normalized_small.astype(np.float32) * (1.0 / 255.0)
                 if contrast_mode == 'gamma':
                     gamma = 0.5 + dde_clip_limit * 0.15
                     enhanced = (np.power(np.clip(x, 1e-6, 1), gamma) * 255).astype(np.uint8)
@@ -1222,14 +1384,16 @@ def main():
                     lo = float(np.percentile(normalized_small, 2))
                     hi = float(np.percentile(normalized_small, 98))
                     if hi > lo:
-                        stretched = ((normalized_small.astype(np.float64) - lo) / (hi - lo) * 255).clip(0, 255).astype(np.uint8)
+                        stretched = ((normalized_small.astype(np.float32) - lo) / (hi - lo) * 255).clip(0, 255).astype(np.uint8)
                     else:
                         stretched = normalized_small
                     alpha = min(1.0, dde_clip_limit / 5.0)
-                    enhanced = (normalized_small.astype(np.float64) * (1 - alpha) + stretched.astype(np.float64) * alpha).astype(np.uint8)
-                else:  # clahe (local adaptive)
-                    clahe = cv2.createCLAHE(clipLimit=dde_clip_limit, tileGridSize=(8, 8))
-                    enhanced = clahe.apply(normalized_small)
+                    enhanced = (normalized_small.astype(np.float32) * (1 - alpha) + stretched.astype(np.float32) * alpha).astype(np.uint8)
+                else:  # clahe (local adaptive) — reuse instance across frames
+                    if _clahe is None or _clahe_clip != dde_clip_limit:
+                        _clahe = cv2.createCLAHE(clipLimit=dde_clip_limit, tileGridSize=(8, 8))
+                        _clahe_clip = dde_clip_limit
+                    enhanced = _clahe.apply(normalized_small)
             else:
                 enhanced = normalized_small
 
@@ -1265,14 +1429,15 @@ def main():
                 normalized = ibp_upscale(normalized_small, SCALE, n_iters=n_iters, lam=lam)
             else:
                 normalized = cv2.resize(normalized_small, (WIDTH, HEIGHT), interpolation=cv2.INTER_CUBIC)
-            
+
         # Apply selected palette
         palette_name, colormap_flag = PALETTES[palette_idx]
-        to_map = (255 - normalized).astype(np.uint8) if palette_invert else normalized
+        to_map = (255 - normalized) if palette_invert else normalized
         colormap = cv2.applyColorMap(to_map, colormap_flag)
 
-        # Save unblended thermal colormap for calibration reference
-        last_thermal_colormap = colormap.copy()
+        # Save unblended thermal colormap for calibration reference (only when RGB blend is on)
+        if rgb_cam_enabled:
+            last_thermal_colormap = colormap.copy()
 
         # --- RGB camera blend ---
         if rgb_cam_enabled and _rgb_cam[0] is not None:
@@ -1339,12 +1504,8 @@ def main():
         if alarm_enabled and max_temp >= alarm_threshold:
             cv2.rectangle(colormap, (0, 0), (WIDTH - 1, HEIGHT - 1), (0, 0, 255), 4)
 
-        # FPS calculation: frames per second = num_frames / elapsed_time
-        if len(fps_times) >= 2:
-            elapsed = fps_times[-1] - fps_times[0]
-            fps = len(fps_times) / elapsed if elapsed > 0 else 0.0
-        else:
-            fps = 0.0
+        # FPS: only new frames are timestamped above; (n-1)/elapsed is the unbiased rate
+        fps = compute_fps(fps_times)
         fps_text = f"{fps:.1f} FPS"
 
         if line_profile_mode and line_profile['start'] and line_profile['end']:
@@ -1446,11 +1607,12 @@ def main():
             cv2.putText(display_img, f"FPS: {fps:.1f}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"frame_count: {frame_count}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"cam_index: {cam_index}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(display_img, f"frame_size (bytes): {frame_size}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            cv2.putText(display_img, f"frame_size (bytes): {FRAME_SIZE}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"SCALE: {SCALE}  WIDTH: {WIDTH}  HEIGHT: {HEIGHT}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"palette_idx: {palette_idx}  palette: {palette_name}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"show_min_max: {show_min_max}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
-            cv2.putText(display_img, f"reader.running: {reader.running}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+            _rr = reader.running if reader is not None else False
+            cv2.putText(display_img, f"reader.running: {_rr}  reconnecting: {reconnecting}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"raw temp (before clip) min: {raw_min_c:.2f} C  max: {raw_max_c:.2f} C", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"display temp min: {min_temp:.2f} C  max: {max_temp:.2f} C", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
             cv2.putText(display_img, f"min_pt: ({min_x}, {min_y})  max_pt: ({max_x}, {max_y})", (15, y0), font, fs, (255, 255, 200), 1, cv2.LINE_AA); y0 += line_h
@@ -1513,16 +1675,31 @@ def main():
                 try:
                     import pyvirtualcam
                     _virtual_cam[0] = pyvirtualcam.Camera(_VCAM_SIZE[0], _VCAM_SIZE[1], fps=25)
-                    print("Virtual cam: streaming to OBS Virtual Camera (640x480)")
+                    print("Virtual cam: opened device =", getattr(_virtual_cam[0], 'device', '?'), "| size 640x480 @ 25 fps")
+                    _vcam_send_count[0] = 0
                 except Exception as e:
                     print("Virtual cam: failed.", e)
-                    print("  -> macOS: install OBS, then in OBS use Tools -> Start Virtual Camera (once), then press U again.")
+                    err_lower = str(e).lower()
+                    if "not installed" in err_lower or "obs" in err_lower:
+                        print("  -> macOS 13+ and OBS 30+: pyvirtualcam 0.14+ required (needs Python 3.9+).")
+                        print("     Use Python 3.9+ then: pip install -U pyvirtualcam")
+                        print("  -> Or: Recovery mode -> Terminal -> system-override legacy-camera-plugins-without-sw-camera-indication=on, reboot; use OBS 29.")
+                        print("  -> Then: OBS -> Start Virtual Camera -> Stop -> close OBS; press U again.")
+                    else:
+                        print("  -> macOS: install OBS, start Virtual Camera once, then press U again.")
                     virtual_cam_enabled = False
             if _virtual_cam[0] is not None:
                 try:
                     vframe = cv2.resize(display_img, _VCAM_SIZE, interpolation=cv2.INTER_LINEAR)
-                    _virtual_cam[0].send(cv2.cvtColor(vframe, cv2.COLOR_BGR2RGB))
-                except Exception:
+                    rgb = cv2.cvtColor(vframe, cv2.COLOR_BGR2RGB)
+                    _virtual_cam[0].send(rgb)
+                    _vcam_send_count[0] += 1
+                    if _vcam_send_count[0] <= 3 or _vcam_send_count[0] % 50 == 0:
+                        n = _vcam_send_count[0]
+                        mean_val = float(np.mean(rgb))
+                        print(f"VCAM send #{n}  shape={rgb.shape}  mean={mean_val:.1f}  (0=black)")
+                except Exception as e:
+                    print("VCAM send failed:", e)
                     try:
                         _virtual_cam[0].close()
                     except Exception:
@@ -1542,9 +1719,6 @@ def main():
             'delta_t_enabled': delta_t_enabled, 'isotherm_enabled': isotherm_enabled, 'anomaly_enabled': anomaly_enabled,
             'fps_text': fps_text,
         }
-        status_strip = np.zeros((STATUS_BAR_H, dw, 3), dtype=np.uint8)
-        display_img = np.vstack([display_img, status_strip])
-        draw_status_bar(display_img, dh, dw, status_state)
         tb_states = {
             'minmax': show_min_max, 'freeze': frozen, 'fahr': use_fahrenheit,
             'invert': palette_invert, 'roi': roi_state['active'], 'line': line_profile_mode,
@@ -1558,10 +1732,16 @@ def main():
             'rgb': rgb_cam_enabled,
             'debug': debug_mode, 'help': show_controls_overlay,
         }
-        tb_strip = np.zeros((TOOLBAR_H, dw, 3), dtype=np.uint8)
-        display_img = np.vstack([display_img, tb_strip])
-        draw_toolbar(display_img, dh + STATUS_BAR_H, dw, tb_states, _tb_hover_id[0])
-        cv2.imshow(window_name, display_img)
+        total_h = dh + STATUS_BAR_H + TOOLBAR_H
+        if _ui_canvas is None or _ui_canvas.shape[0] != total_h or _ui_canvas.shape[1] != dw:
+            _ui_canvas = np.empty((total_h, dw, 3), dtype=np.uint8)
+        _ui_canvas[:dh] = display_img
+        _ui_canvas[dh:dh + STATUS_BAR_H] = 0
+        _ui_canvas[dh + STATUS_BAR_H:] = 0
+        draw_status_bar(_ui_canvas, dh, dw, status_state)
+        draw_toolbar(_ui_canvas, dh + STATUS_BAR_H, dw, tb_states, _tb_hover_id[0])
+        last_display_img = _ui_canvas
+        cv2.imshow(window_name, _ui_canvas)
 
         key = cv2.waitKey(1)
         if window_closed():
@@ -1767,8 +1947,7 @@ def main():
 
     save_app_settings(palette_idx, dde_clip_limit, dde_sharp_strength, dde_sharp_sigma, palette_invert, contrast_mode)
     save_panel_layout(panels)
-    reader.running = False
-    process.terminate()
+    stop_thermal_capture(process, reader)
     cv2.destroyAllWindows()
     if 'tray_icon' in locals():
         tray_icon.stop()
