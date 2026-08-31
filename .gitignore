@@ -10,7 +10,7 @@ __pycache__/
 *.pb
 FSRCNN_x3.pb
 
-# User state and captures
+# User state and captures (legacy in-repo locations; now under ~/Library and ~/Pictures)
 .p2pro_layout.json
 .p2pro_settings.json
 snapshot_*.png

@@ -40,7 +40,7 @@ Connect the P2 Pro; the app auto-detects it and opens the viewer. Use **I** in-a
 - **IBP upscale (Y):** Iterative Back-Projection — training-free refinement; **J** / **K** = strength 1–10.
 - **Burst SR (E):** Multi-frame super-resolution from subpixel shifts (Samsung-style): buffers frames, estimates shift via phase correlation, fuses to HR. Slight camera/scene motion improves result.
 - **FPN correction:** **C** = running per-pixel calibration; **X** = one-frame reference (capture now, subtract offset; **X** again = reset).
-- **De-noise (G):** NLM + temporal smoothing. **,** **.** = strength.
+- **De-noise (G):** Edge-Gated Local Mean + temporal EMA — averages only temperature-homogeneous neighbors, preserves real edges. **,** **.** = strength.
 
 ### Orientation (rotate & flip)
 
@@ -68,19 +68,27 @@ Useful when the camera is mounted upside-down or sideways; all overlays and meas
 ### Panels (Trend, Histogram, Line profile)
 
 - **Drag** by the title bar; **resize** by the bottom-right grip.
-- Layout is saved to `.p2pro_layout.json` and restored on next run.
+- Layout is saved to `~/Library/Application Support/Infiray P2 Pro/layout.json` and restored on next run.
 - White border indicates drag state.
 
 ### Other
 
 - **Rotate & flip** — **←/→** rotate 90°; **↑** flip V, **↓** flip H (see Orientation above).
 - **Freeze (Space)** — Pause stream; snapshot and other keys still work.
-- **Snapshot (S)** — Saves `snapshot_YYYYMMDD_HHMMSS.png` (current view with overlays).
+- **Snapshot (S)** — Saves `~/Pictures/Infiray P2 Pro/snapshot_YYYYMMDD_HHMMSS.png` (current view with overlays).
 - **Units (F)** — Toggle Celsius / Fahrenheit.
 - **Alarm (A)** — Red border + "HOT!" when max temp ≥ 60°C.
 - **Debug (D)** — Technical overlay (FPS, coords, temps, flags).
 - **Help (I)** — Full keyboard reference.
-- **Quit (Q)** — Exits; panel layout is saved.
+- **Quit (Q)** — Exits; panel layout and settings are saved.
+
+### Saved between runs
+
+Palette and invert, contrast mode and DDE parameters, DDE on/off, °C/°F, temperature-range
+preset, rotation and flips, de-noise and IBP strength, RGB blend mode / alpha / hot threshold /
+zoom, and the alarm threshold. Stored in
+`~/Library/Application Support/Infiray P2 Pro/settings.json`; the file can be hand-edited, which
+is currently the only way to change the alarm threshold (default 60 °C).
 - **System tray** — Menu bar icon with Quit (macOS).
 
 ### Virtual webcam (U) — for messengers / streaming
@@ -102,7 +110,7 @@ The **processed** thermal stream (after DDE, colormap, overlays) can be sent to 
 | `fpn_correction.py` | Fixed-pattern noise: per-pixel running mean, offset subtraction. |
 | `requirements.txt` | Python dependencies. |
 | `Infiray P2 Pro.spec` | PyInstaller spec for macOS .app bundle. |
-| `.p2pro_layout.json` | Saved panel positions/sizes (created at runtime). |
+| `~/Library/Application Support/Infiray P2 Pro/` | Saved panel layout and settings (created at runtime; outside the app bundle so they persist). |
 | `make-demo-gif.sh` | Script to build `demo.gif` from `demo.mov` (ffmpeg + gifsicle). |
 
 ---

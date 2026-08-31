@@ -37,27 +37,35 @@ class BurstSR:
         self.max_frames = max(2, min(max_frames, 25))
         self._buffer = deque(maxlen=self.max_frames)  # list of (frame_float32, dx, dy)
         self._ref = None  # reference frame for alignment
+        self._rejects = 0  # consecutive frames whose shift was out of range
+
+    # A fixed reference drifts out of range as the scene moves; once every shift
+    # is rejected the fusion silently degrades into plain frame averaging, i.e.
+    # motion blur. Re-anchor instead.
+    MAX_SHIFT_PX = 5.0
+    REANCHOR_AFTER = 3
 
     def reset(self):
         self._buffer.clear()
         self._ref = None
+        self._rejects = 0
 
     def _estimate_shift(self, ref, curr):
-        """Subpixel shift of curr relative to ref. Returns (dx, dy) in pixels."""
+        """Subpixel shift of curr relative to ref, or None if it is unusable."""
         if ref.shape != curr.shape or ref.dtype != curr.dtype:
-            return 0.0, 0.0
+            return None
         try:
             # Phase correlation: shift of curr w.r.t. ref
             (dx, dy), _ = cv2.phaseCorrelate(
                 np.asarray(ref, dtype=np.float32),
                 np.asarray(curr, dtype=np.float32),
             )
-            # Reject huge shifts (scene change or failure)
-            if abs(dx) > 5 or abs(dy) > 5:
-                return 0.0, 0.0
-            return float(dx), float(dy)
         except cv2.error:
-            return 0.0, 0.0
+            return None
+        # Reject huge shifts (scene change or failure)
+        if abs(dx) > self.MAX_SHIFT_PX or abs(dy) > self.MAX_SHIFT_PX:
+            return None
+        return float(dx), float(dy)
 
     def push(self, lr_frame: np.ndarray) -> None:
         """Add one LR frame (H, W) uint8 or float. Updates buffer and shifts."""
@@ -66,9 +74,24 @@ class BurstSR:
             return
         if self._ref is None:
             self._ref = lr.copy()
+            self._rejects = 0
             self._buffer.append((lr.copy(), 0.0, 0.0))
             return
-        dx, dy = self._estimate_shift(self._ref, lr)
+
+        shift = self._estimate_shift(self._ref, lr)
+        if shift is None:
+            self._rejects += 1
+            if self._rejects >= self.REANCHOR_AFTER:
+                # The scene has moved away from the reference: start a new burst
+                # rather than fusing frames we cannot align.
+                self._buffer.clear()
+                self._ref = lr.copy()
+                self._rejects = 0
+                self._buffer.append((lr.copy(), 0.0, 0.0))
+            return
+
+        self._rejects = 0
+        dx, dy = shift
         self._buffer.append((lr.copy(), dx, dy))
 
     def get_hr(self):

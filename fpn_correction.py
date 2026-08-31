@@ -24,13 +24,11 @@ class FPNCorrector:
         """
         self.shape = shape
         self.alpha = float(alpha)
-        self._running_sum = None
-        self._running_count = 0.0  # for stability in early frames
+        self._running_mean = None
 
     def reset(self):
         """Reset calibration state (e.g. after scene change or user request)."""
-        self._running_sum = None
-        self._running_count = 0.0
+        self._running_mean = None
 
     def apply(self, frame: np.ndarray) -> np.ndarray:
         """
@@ -47,16 +45,16 @@ class FPNCorrector:
         if frame.shape != self.shape:
             return frame.astype(np.uint16) if frame.dtype != np.uint16 else np.asarray(frame, dtype=np.uint16)
 
-        if self._running_sum is None:
-            self._running_sum = frame.copy()
-            self._running_count = 1.0
+        if self._running_mean is None:
+            self._running_mean = frame.copy()
             return np.clip(frame, 0, 65535).astype(np.uint16)
 
-        # Exponential moving average: running_mean = alpha * running_mean + (1-alpha) * frame
-        self._running_sum = self.alpha * self._running_sum + (1.0 - self.alpha) * frame
-        self._running_count = self.alpha * self._running_count + (1.0 - self.alpha)
+        # Exponential moving average: running_mean = alpha * running_mean + (1-alpha) * frame.
+        # (An earlier version divided by a "running count" that is identically 1.0
+        # for this recurrence -- a no-op, now dropped.)
+        self._running_mean = self.alpha * self._running_mean + (1.0 - self.alpha) * frame
 
-        running_mean = self._running_sum / self._running_count
+        running_mean = self._running_mean
         global_mean = np.mean(running_mean)
         offset_map = running_mean - global_mean
 

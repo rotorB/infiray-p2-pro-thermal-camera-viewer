@@ -38,7 +38,9 @@ def find_rgb_camera_index(thermal_index: str | None = None) -> int | None:
 
     try:
         cmd = [ffmpeg_path, '-f', 'avfoundation', '-list_devices', 'true', '-i', '""']
-        result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True, timeout=5)
+        result = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=5,
+        )
         video_section = True
         for line in result.stderr.split('\n'):
             if 'AVFoundation video devices:' in line:
@@ -57,14 +59,25 @@ def find_rgb_camera_index(thermal_index: str | None = None) -> int | None:
     except Exception:
         pass
 
-    # Fallback: probe cv2 indices directly
+    # Fallback: probe cv2 indices directly. This cannot tell devices apart by
+    # name, so without a known thermal index it could hand back the P2 Pro that
+    # ffmpeg is already streaming -- refuse rather than fight over the device.
+    try:
+        skip = int(thermal_index) if thermal_index is not None else None
+    except (TypeError, ValueError):
+        skip = None
+    if skip is None:
+        return None
+
     for idx in range(5):
-        if thermal_index is not None and idx == int(thermal_index):
+        if idx == skip:
             continue
         cap = cv2.VideoCapture(idx)
-        if cap.isOpened():
+        try:
+            if cap.isOpened():
+                return idx
+        finally:
             cap.release()
-            return idx
 
     return None
 
@@ -109,11 +122,22 @@ class RGBCamera:
         return True
 
     def stop(self):
-        """Stop capture thread and release camera."""
+        """Stop capture thread and release camera.
+
+        release() while the worker is inside read() is a use-after-free in
+        OpenCV, and read() does hang when a USB camera is yanked. If the thread
+        will not join, leak the capture instead: it is a daemon thread and the
+        OS reclaims the device when the process exits.
+        """
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                print("RGB camera: capture thread did not stop; leaving device open.")
+                with self._lock:
+                    self._frame = None
+                return
         if self._cap is not None:
             self._cap.release()
             self._cap = None
@@ -184,7 +208,9 @@ class GradientAligner:
     ECC_ITERS: int = 30
     ECC_EPS: float = 1e-3
     EMA_H: float = 0.12   # smooth full 3x3 homography to reduce jitter
-    DETECT_INTERVAL: int = 2
+    # ECC homography costs ~20 ms; every 2nd frame ate half the 25 fps budget.
+    DETECT_INTERVAL: int = 6
+    MAX_ECC_FAILURES: int = 3   # give up on the warm start after this many misses
     ZOOM_MIN: float = 0.5
     ZOOM_MAX: float = 2.0
 
@@ -197,6 +223,10 @@ class GradientAligner:
         self._last_grad_rgb: np.ndarray | None = None
         self._crop_rect: tuple[int, int, int, int] = (0, 0, 0, 0)  # (x, y, w, h) on full RGB
         self._zoom: float = 1.0
+        # Warm start: reusing the previous solution converges in far fewer
+        # iterations than restarting from identity on every run.
+        self._H_work: np.ndarray = np.eye(3, dtype=np.float32)
+        self._ecc_failures: int = 0
 
     @property
     def is_tracking(self) -> bool:
@@ -250,7 +280,7 @@ class GradientAligner:
         self._last_grad_thermal = grad_t
         self._last_grad_rgb = grad_r
 
-        H_work = np.eye(3, dtype=np.float32)
+        H_work = self._H_work.copy()
         criteria = (
             cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
             self.ECC_ITERS,
@@ -266,9 +296,16 @@ class GradientAligner:
             )
         except cv2.error as e:
             self._last_error = str(e)[:40]
+            self._ecc_failures += 1
+            if self._ecc_failures >= self.MAX_ECC_FAILURES:
+                # The seed is probably what we keep failing from; start clean.
+                self._H_work = np.eye(3, dtype=np.float32)
+                self._ecc_failures = 0
             return self._tracking
 
         self._last_error = ''
+        self._ecc_failures = 0
+        self._H_work = np.asarray(H_work, dtype=np.float32).copy()
         H_work = np.asarray(H_work, dtype=np.float64)
 
         # H_work: rgb_work (ww,wh) -> thermal_work (ww,wh). Map to display and to cropped RGB:
@@ -323,6 +360,8 @@ class GradientAligner:
     def reset(self):
         self._tracking = False
         self._H = np.eye(3, dtype=np.float64)
+        self._H_work = np.eye(3, dtype=np.float32)
+        self._ecc_failures = 0
         self._crop_rect = (0, 0, 0, 0)
         self._last_error = ''
         self._last_grad_thermal = None
