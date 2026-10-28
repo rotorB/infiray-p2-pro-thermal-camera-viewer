@@ -1,0 +1,183 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements"
+    xsi="http://www.w3.org/2001/XMLSchema-instance"
+    engine="UnityEngine.UIElements"
+    noNamespaceSchemaLocation="../../UIElementsSchema/UIElements.xsd"
+    editor-extension-mode="False">
+
+    <Style src="DebugMenu.uss" />
+
+    <ui:VisualElement name="debug-root" class="debug-root">
+
+        <!-- ===== LEFT NAV PANEL ===== -->
+        <ui:VisualElement name="nav-panel" class="nav-panel">
+            <ui:VisualElement class="nav-header">
+                <ui:Label text="QUESTROOMSCAN" class="nav-header-title" />
+                <ui:Label text="DEBUG" class="nav-header-sub" />
+            </ui:VisualElement>
+
+            <ui:Button name="nav-scan"        text="Scan"        class="nav-btn nav-btn--active" />
+            <ui:Button name="nav-saved"       text="Saved Scans" class="nav-btn" />
+            <ui:Button name="nav-refine"      text="Refine"      class="nav-btn" />
+            <ui:Button name="nav-training"    text="Gaussian Splat"    class="nav-btn" />
+            <ui:Button name="nav-tools"       text="Tools"       class="nav-btn" />
+
+            <ui:VisualElement class="nav-spacer" />
+            <ui:Label name="val-fps" text="-- FPS" class="nav-fps" />
+        </ui:VisualElement>
+
+        <!-- ===== RIGHT DETAIL PANEL ===== -->
+        <ui:VisualElement name="detail-panel" class="detail-panel">
+
+            <!-- ── SCAN VIEW ── -->
+            <ui:VisualElement name="view-scan" class="detail-view">
+                <ui:Label text="SCAN" class="view-title" />
+
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Scanning" class="status-key" />
+                    <ui:Label name="val-scanning" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Integrations" class="status-key" />
+                    <ui:Label name="val-integrations" text="0" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Keyframes" class="status-key" />
+                    <ui:Label name="val-keyframes" text="0" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Render" class="status-key" />
+                    <ui:Label name="val-render" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Package" class="status-key" />
+                    <ui:Label name="val-package" text="--" class="status-val" />
+                </ui:VisualElement>
+
+                <ui:Label text="COVERAGE" class="view-subtitle" />
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Progress" class="status-key" />
+                    <ui:Label name="val-progress" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Phase" class="status-key" />
+                    <ui:Label name="val-phase" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Color Coverage" class="status-key" />
+                    <ui:Label name="val-color-coverage" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Frozen" class="status-key" />
+                    <ui:Label name="val-frozen" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Mesh" class="status-key" />
+                    <ui:Label name="val-mesh-stats" text="--" class="status-val" />
+                </ui:VisualElement>
+
+                <ui:VisualElement class="btn-group">
+                    <ui:Button name="btn-toggle-scan" text="Stop Scanning" class="action-btn" />
+                    <ui:Button name="btn-render-mode" text="Render: Vertex" class="action-btn action-btn--primary" />
+                    <ui:Button name="btn-freeze-tint" text="Freeze Tint: ON" class="action-btn" />
+                    <ui:Button name="btn-scene-objects" text="Objects: OFF" class="action-btn" />
+                    <ui:Button name="btn-save-scan" text="Save Scan" class="action-btn" />
+                    <ui:Button name="btn-delete-artifact" text="Delete Artifact" class="action-btn action-btn--danger" />
+                </ui:VisualElement>
+            </ui:VisualElement>
+
+            <!-- ── SAVED SCANS VIEW ── -->
+            <ui:VisualElement name="view-saved" class="detail-view" style="display:none;">
+                <ui:Label text="SAVED SCANS" class="view-title" />
+                <ui:ScrollView name="scan-list" class="scan-list" />
+                <ui:Label name="lbl-no-scans" text="No saved scans" class="empty-label" />
+            </ui:VisualElement>
+
+            <!-- ── REFINE VIEW ── -->
+            <ui:VisualElement name="view-refine" class="detail-view" style="display:none;">
+                <ui:Label text="TEXTURE REFINEMENT" class="view-title" />
+
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="On-Device" class="status-key" />
+                    <ui:Label name="val-refine-status" text="Idle" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="HQ (Server)" class="status-key" />
+                    <ui:Label name="val-hq-status" text="Idle" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Mesh Enhance" class="status-key" />
+                    <ui:Label name="val-mesh-enhance-status" text="Idle" class="status-val" />
+                </ui:VisualElement>
+
+                <ui:Label text="MESH STATS" class="view-subtitle" />
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Refined" class="status-key" />
+                    <ui:Label name="val-refined-mesh-stats" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Simplified" class="status-key" />
+                    <ui:Label name="val-simplified-mesh-stats" text="--" class="status-val" />
+                </ui:VisualElement>
+
+                <ui:VisualElement class="btn-group">
+                    <ui:Button name="btn-refine-tex" text="Refine Textures" class="action-btn action-btn--primary" />
+                    <ui:Button name="btn-hq-refine" text="HQ Refine (Server)" class="action-btn action-btn--primary" />
+                    <ui:Button name="btn-mesh-enhance" text="Enhance Mesh (Server)" class="action-btn action-btn--primary" />
+                </ui:VisualElement>
+            </ui:VisualElement>
+
+            <!-- ── TRAINING VIEW ── -->
+            <ui:VisualElement name="view-training" class="detail-view" style="display:none;">
+                <ui:Label text="GAUSSIAN SPLAT" class="view-title" />
+
+                <ui:TextField name="field-server-url" label="Server" value="http://192.168.1.100:8420" class="server-url-field" />
+
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="State" class="status-key" />
+                    <ui:Label name="val-train-state" text="--" class="status-val" />
+                </ui:VisualElement>
+
+                <ui:VisualElement class="progress-bar">
+                    <ui:VisualElement name="progress-fill" class="progress-fill" />
+                </ui:VisualElement>
+
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Progress" class="status-key" />
+                    <ui:Label name="val-train-progress" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Iteration" class="status-key" />
+                    <ui:Label name="val-train-iter" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Elapsed" class="status-key" />
+                    <ui:Label name="val-train-elapsed" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Backend" class="status-key" />
+                    <ui:Label name="val-train-backend" text="--" class="status-val" />
+                </ui:VisualElement>
+                <ui:VisualElement class="status-row">
+                    <ui:Label text="Message" class="status-key" />
+                    <ui:Label name="val-train-message" text="--" class="status-val status-val--small" />
+                </ui:VisualElement>
+
+                <ui:VisualElement class="btn-group">
+                    <ui:Button name="btn-gs-train" text="Start GS Training" class="action-btn action-btn--primary" />
+                    <ui:Button name="btn-cancel-train" text="Cancel Training" class="action-btn action-btn--danger" />
+                </ui:VisualElement>
+            </ui:VisualElement>
+
+            <!-- ── TOOLS VIEW ── -->
+            <ui:VisualElement name="view-tools" class="detail-view" style="display:none;">
+                <ui:Label text="TOOLS" class="view-title" />
+
+                <ui:VisualElement class="btn-group">
+                    <ui:Button name="btn-export-pc" text="Export Point Cloud" class="action-btn" />
+                    <ui:Button name="btn-clear-all" text="Clear All Data" class="action-btn action-btn--danger" />
+                </ui:VisualElement>
+            </ui:VisualElement>
+
+        </ui:VisualElement>
+    </ui:VisualElement>
+</ui:UXML>

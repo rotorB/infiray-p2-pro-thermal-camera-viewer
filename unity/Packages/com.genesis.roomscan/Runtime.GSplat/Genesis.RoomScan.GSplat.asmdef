@@ -1,0 +1,25 @@
+{
+  "name": "Genesis.RoomScan.GSplat",
+  "rootNamespace": "Genesis.RoomScan.GSplat",
+  "references": [
+    "Genesis.RoomScan",
+    "GaussianSplatting"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [
+    "HAS_GAUSSIAN_SPLATTING"
+  ],
+  "versionDefines": [
+    {
+      "name": "org.nesnausk.gaussian-splatting",
+      "expression": "",
+      "define": "HAS_GAUSSIAN_SPLATTING"
+    }
+  ],
+  "noEngineReferences": false
+}
