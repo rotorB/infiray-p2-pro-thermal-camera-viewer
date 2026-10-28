@@ -11,6 +11,8 @@ namespace P2Pro
     /// permissions, lets the Android plugin (android/unityplugin) open the device, then streams
     /// through libp2prouvc and keeps <see cref="Temperature"/>, a 256x192 RFloat texture in °C,
     /// up to date. Texture row 0 is the bottom of the image.
+    /// Each frame carries its CLOCK_MONOTONIC arrival time (<see cref="TimeNs"/>, the XrTime
+    /// base) and the head pose at that time, for pairing with the headset cameras.
     /// </summary>
     public class ThermalCamera : MonoBehaviour
     {
@@ -22,14 +24,21 @@ namespace P2Pro
 
         // The camera's YUYV frame is Width x 2*Height: the 8-bit image on top, temperatures below.
         [DllImport("p2prouvc")] static extern int p2pro_open(int fd, int width, int height, int fps);
-        [DllImport("p2prouvc")] static extern int p2pro_take_celsius([Out] float[] dst, int width, int height, [Out] float[] stats);
+        [DllImport("p2prouvc")] static extern int p2pro_take_celsius([Out] float[] dst, int width, int height, [Out] float[] stats, out long timeNs);
         [DllImport("p2prouvc")] static extern void p2pro_close();
+        [DllImport("p2prouvc")] public static extern long p2pro_now_ns();
 
         public Texture2D Temperature { get; private set; }
         public float Min { get; private set; }
         public float Max { get; private set; }
         public float Center { get; private set; }
         public int FrameCount { get; private set; }
+        /// <summary>CLOCK_MONOTONIC ns when the latest frame finished arriving over USB.</summary>
+        public long TimeNs { get; private set; }
+        /// <summary>Head pose (tracking space) at <see cref="TimeNs"/>.</summary>
+        public Pose HeadPose { get; private set; }
+        /// <summary>Latest frame in °C, same layout as <see cref="Temperature"/>. Overwritten on the next frame.</summary>
+        public float[] Celsius => _pixels;
         public string Status { get; private set; } = "Waiting for permissions";
 
         /// <summary>Raised on the main thread after <see cref="Temperature"/> got a new frame.</summary>
@@ -106,7 +115,7 @@ namespace P2Pro
             }
 
             if (!_streaming) return;
-            int result = p2pro_take_celsius(_pixels, Width, Height, _stats);
+            int result = p2pro_take_celsius(_pixels, Width, Height, _stats, out long timeNs);
             if (result < 0)
             {
                 CloseStream();
@@ -120,9 +129,18 @@ namespace P2Pro
             Min = _stats[0];
             Max = _stats[1];
             Center = _stats[2];
+            TimeNs = timeNs;
+            HeadPose = HeadPoseAt(timeNs);
             FrameCount++;
             FrameReady?.Invoke();
             LogStats();
+        }
+
+        /// <summary>Head pose in tracking space at a CLOCK_MONOTONIC / XrTime instant.</summary>
+        public static Pose HeadPoseAt(long timeNs)
+        {
+            var pose = OVRPlugin.GetNodePoseStateAtTime(timeNs * 1e-9, OVRPlugin.Node.Head).Pose.ToOVRPose();
+            return new Pose(pose.position, pose.orientation);
         }
 
         void OpenStream(int fd)

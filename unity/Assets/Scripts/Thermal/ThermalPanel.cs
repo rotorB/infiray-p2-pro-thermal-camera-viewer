@@ -3,8 +3,9 @@ using UnityEngine;
 namespace P2Pro
 {
     /// <summary>
-    /// World-space panel with the live P2 Pro image, coloured by a palette. Placed in front of the
-    /// head when the first frame arrives.
+    /// World-space debug view: the live P2 Pro image coloured by a palette (left) and the headset
+    /// RGB camera image (right). Placed in front of the head when the first thermal frame arrives.
+    /// Also sets up the RGB camera and the thermal/RGB frame pairing.
     /// Controls: B = next palette, right thumbstick click = range mode, Y = bring the panel back
     /// in front of you.
     /// </summary>
@@ -13,6 +14,7 @@ namespace P2Pro
         enum RangeMode { Auto, Room, Wide }
 
         const float PanelWidth = 0.4f;
+        const float Gap = 0.02f;
         const float Distance = 0.7f;
         const float DropBelowEyes = 0.1f;
 
@@ -21,8 +23,12 @@ namespace P2Pro
         static readonly int MinId = Shader.PropertyToID("_Min");
         static readonly int MaxId = Shader.PropertyToID("_Max");
 
+        static readonly int RgbTexId = Shader.PropertyToID("_MainTex");
+
         ThermalCamera _camera;
+        HeadsetRgbCamera _rgb;
         Material _material;
+        Material _rgbMaterial;
         Transform _panel;
         Texture2D[] _palettes;
         int _palette;
@@ -35,6 +41,8 @@ namespace P2Pro
         {
             _camera = gameObject.AddComponent<ThermalCamera>();
             _camera.FrameReady += OnFrame;
+            _rgb = gameObject.AddComponent<HeadsetRgbCamera>();
+            gameObject.AddComponent<FramePairing>().Init(_camera, _rgb);
 
             _palettes = new Texture2D[Palettes.Names.Length];
             for (int i = 0; i < _palettes.Length; i++) _palettes[i] = Palettes.Build(i);
@@ -42,17 +50,33 @@ namespace P2Pro
             _material = new Material(Resources.Load<Shader>("P2ProThermal"));
             _material.SetTexture(PaletteId, _palettes[_palette]);
 
+            _rgbMaterial = new Material(Resources.Load<Shader>("P2ProRgb"));
+
+            var root = new GameObject("Thermal debug view");
+            root.SetActive(false);
+            _panel = root.transform;
+            float aspect = (float)ThermalCamera.Height / ThermalCamera.Width;  // 3:4, RGB is 1280x960 too
+            AddQuad("Thermal", _material, -(PanelWidth + Gap) / 2, aspect);
+            AddQuad("RGB", _rgbMaterial, (PanelWidth + Gap) / 2, aspect);
+        }
+
+        void AddQuad(string name, Material material, float x, float aspect)
+        {
             var quad = GameObject.CreatePrimitive(PrimitiveType.Quad);
-            quad.name = "Thermal panel";
+            quad.name = name;
             Destroy(quad.GetComponent<Collider>());
-            quad.GetComponent<MeshRenderer>().sharedMaterial = _material;
-            quad.transform.localScale = new Vector3(PanelWidth, PanelWidth * ThermalCamera.Height / ThermalCamera.Width, 1);
-            quad.SetActive(false);
-            _panel = quad.transform;
+            quad.GetComponent<MeshRenderer>().sharedMaterial = material;
+            quad.transform.SetParent(_panel, false);
+            quad.transform.localPosition = new Vector3(x, 0, 0);
+            quad.transform.localScale = new Vector3(PanelWidth, PanelWidth * aspect, 1);
         }
 
         void Update()
         {
+            var rgbTexture = _rgb.Texture;
+            if (rgbTexture != null && _rgbMaterial.GetTexture(RgbTexId) != rgbTexture)
+                _rgbMaterial.SetTexture(RgbTexId, rgbTexture);
+
             if (OVRInput.GetDown(OVRInput.Button.Four)) PlaceInFrontOfHead();
             if (OVRInput.GetDown(OVRInput.Button.Two))
             {
@@ -112,6 +136,7 @@ namespace P2Pro
             if (_camera != null) _camera.FrameReady -= OnFrame;
             if (_panel != null) Destroy(_panel.gameObject);
             Destroy(_material);
+            Destroy(_rgbMaterial);
             foreach (var p in _palettes) Destroy(p);
         }
     }

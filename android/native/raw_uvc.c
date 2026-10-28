@@ -61,6 +61,7 @@ static struct {
     uint8_t *frame;         /* latest complete frame, guarded by lock */
     size_t frame_bytes;
     uint64_t sequence;      /* bumped for every complete frame */
+    int64_t frame_time_ns;  /* CLOCK_MONOTONIC when the latest frame was complete */
     uint64_t delivered;     /* sequence last handed to Java */
     uint64_t short_frames;
     /* uvc_stream_ctrl_t is ~48 bytes; leave room in case the library's copy is larger. */
@@ -91,12 +92,20 @@ static int load_libuvc(void) {
     return 0;
 }
 
+static int64_t monotonic_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t) t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
 static void on_frame(void *frame, void *user_ptr) {
     (void) user_ptr;
     const uvc_frame_head_t *f = frame;
+    int64_t now = monotonic_ns();
     pthread_mutex_lock(&cam.lock);
     if (cam.frame && f->data_bytes >= cam.frame_bytes) {
         memcpy(cam.frame, f->data, cam.frame_bytes);
+        cam.frame_time_ns = now;
         cam.sequence++;
         pthread_cond_signal(&cam.ready);
     } else if (cam.short_frames++ % 100 == 0) {
@@ -179,10 +188,12 @@ Java_com_p2pro_quest_RawUvc_nativeOpen(JNIEnv *env, jobject thiz, jint fd, jint 
 /*
  * Copies the next unseen frame's temperature half into `dst` as °C, `width` x `height` values
  * (256 x 192 for the P2 Pro), rows flipped so row 0 is the bottom of the image (texture order).
- * `stats` receives min, max and the centre pixel in °C. Returns 1 for a new frame, 0 when there
- * is none yet, -1 when the camera is not streaming or the size does not match.
+ * `stats` receives min, max and the centre pixel in °C, `time_ns` the CLOCK_MONOTONIC time the
+ * frame finished arriving over USB (the same time base as OpenXR's XrTime on Quest; the sensor
+ * exposure is earlier by the camera's latency). Returns 1 for a new frame, 0 when there is none
+ * yet, -1 when the camera is not streaming or the size does not match.
  */
-P2PRO_API int p2pro_take_celsius(float *dst, int width, int height, float *stats) {
+P2PRO_API int p2pro_take_celsius(float *dst, int width, int height, float *stats, int64_t *time_ns) {
     int result;
     pthread_mutex_lock(&cam.lock);
     if (!cam.running) {
@@ -209,6 +220,7 @@ P2PRO_API int p2pro_take_celsius(float *dst, int width, int height, float *stats
         stats[0] = lo;
         stats[1] = hi;
         stats[2] = dst[(size_t) (height / 2) * width + width / 2];
+        *time_ns = cam.frame_time_ns;
         cam.delivered = cam.sequence;
         result = 1;
     }
@@ -254,6 +266,11 @@ Java_com_p2pro_quest_RawUvc_nativeWaitFrame(JNIEnv *env, jobject thiz, jobject b
     }
     pthread_mutex_unlock(&cam.lock);
     return result;
+}
+
+/* CLOCK_MONOTONIC now, to compare the frame time base with other clocks. */
+P2PRO_API int64_t p2pro_now_ns(void) {
+    return monotonic_ns();
 }
 
 /* Stops streaming and wakes any waiting reader. Safe to call when nothing is open. */

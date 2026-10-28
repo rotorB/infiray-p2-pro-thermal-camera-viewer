@@ -6,6 +6,14 @@ as a temperature-coloured 3D mesh of the room (Supervision 2).
 
 Status legend: [x] done, [~] in progress, [ ] not started.
 
+## Rule: temperatures travel, colours are applied at the end
+
+Thermal data leaves the camera and moves through every stage (calibration, raster fusion, mesh
+vertices, textures, export) as temperature in °C, never as palette colours. A palette is applied
+only in the final shader that draws it, so palette and range can change live and the measured
+values are never lost. Any buffer, texture or vertex attribute that carries thermal data holds
+°C (float/half), not RGB.
+
 ## Decision: Unity for everything after Phase 0 (2026-10-28)
 
 Engine: Unity 6.2+ (URP) with Meta XR SDK, OpenXR + Meta OpenXR, AR Foundation and MR Utility
@@ -84,14 +92,26 @@ from Terminal returns correct data.
 
 ## Phase 1: second source, the headset RGB camera
 
-- [ ] Read passthrough RGB frames through the Passthrough Camera API (Camera2 ids 50/51,
-  1280x1280, permission `horizonos.permission.HEADSET_CAMERA`). Use the left or right camera
-  consistently; record which one the calibration belongs to.
-- [ ] Read the camera's lens intrinsics and pose relative to the head from its Camera2
-  characteristics (needed for Phase 2 and Phase 4).
-- [ ] Run both streams at once (Camera2 for RGB, libuvc for thermal); timestamp every frame
-  and pair frames by nearest timestamp.
-- [ ] Debug view: RGB and thermal side by side.
+Done in Unity 2026-10-28 (`Assets/Scripts/Thermal`), verified in the headset:
+
+- [x] RGB frames from MRUK's `PassthroughCameraAccess` (the one QuestRoomScan runs): left
+  camera, 1280x960, ~27 fps (`HeadsetRgbCamera`).
+- [x] Lens intrinsics (focal length, principal point, sensor resolution) and the lens pose
+  relative to the head (`Intrinsics.LensOffset`); camera pose at exposure time.
+- [x] Both streams at once. Common time base: thermal frames carry CLOCK_MONOTONIC arrival
+  time from `raw_uvc.c`; RGB frames carry PCA's monotonic exposure time. Measured: XrTime -
+  CLOCK_MONOTONIC = 0.0 ms, so both are XrTime. Head pose at any frame time from
+  `OVRPlugin.GetNodePoseStateAtTime`.
+- [x] Pairing by nearest time (`FramePairing`, 16-frame thermal ring buffer, °C only): no
+  misses, |offset| mean ~10 ms, max ~20 ms (half a thermal frame, as expected at 25 fps).
+- [x] Debug view: thermal (left) and RGB (right) side by side.
+
+Notes for Phase 2:
+- Thermal time is USB arrival, not exposure: `FramePairing.ThermalLatencyMs` (now 0) should be
+  estimated in calibration (fit the time offset that minimises reprojection error while moving).
+- OVRPlugin head pose + `LensOffset` differs from PCA's own `GetCameraPose()` by ~2 mm, 0°.
+  Use one pose source for both cameras (OVRPlugin head pose at each frame's time) so the
+  thermal extrinsics are fitted against the same reference.
 
 Precondition for everything below: the P2 Pro is mounted rigidly on the headset. Any shift of
 the mount invalidates the calibration.

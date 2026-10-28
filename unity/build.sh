@@ -25,6 +25,10 @@ env -u ANDROID_HOME -u JAVA_HOME PATH=/usr/bin:/bin:/usr/sbin:/sbin \
 grep "\[P2Pro\] Build" "$LOG"
 
 ADB=(adb)
-if [ $# -gt 0 ]; then ADB+=(-s "$1"); fi
+if [ $# -gt 0 ]; then
+  # Unity's Android build restarts the adb server, which drops Wi-Fi connections.
+  if [[ "$1" == *:* ]]; then adb connect "$1" >/dev/null; fi
+  ADB+=(-s "$1")
+fi
 "${ADB[@]}" install -r Builds/p2pro.apk
 "${ADB[@]}" shell am start -n "$PACKAGE/com.unity3d.player.UnityPlayerGameActivity"
