@@ -14,10 +14,12 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <jni.h>
+#include <linux/usbdevice_fs.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -183,6 +185,90 @@ JNIEXPORT jint JNICALL
 Java_com_p2pro_quest_RawUvc_nativeOpen(JNIEnv *env, jobject thiz, jint fd, jint width, jint height, jint fps) {
     (void) env; (void) thiz;
     return p2pro_open(fd, width, height, fps);
+}
+
+/*
+ * InfiRay vendor command channel (vendor control requests on endpoint 0, sent straight to the
+ * USB descriptor next to libuvc's streaming). Transport from LeoDJ/P2Pro-Viewer; the long-form
+ * framing and the auto-shutter parameter from stanelie/p2-viewer (extracted from the official
+ * app's libircmd.so). Only the auto-shutter switch is used: it is volatile (the camera forgets
+ * it when it loses power) and never touches flash. Never add spi_transfer (0x8201) or
+ * sys_reset_to_rom (0x0805) here.
+ */
+#define VC_OUT 0x41
+#define VC_IN 0xC1
+#define VC_WRITE 0x45
+#define VC_READ 0x44
+#define VC_VALUE 0x78
+#define VC_STATUS 0x0200        /* bits 0-1 busy, 2-7 error */
+#define VC_DATA 0x1d08
+#define VC_CMD_LONG 0x9d00
+#define VC_DATA_LONG 0x1d10
+#define CMD_GET_AUTO_SHUTTER 0x8214
+#define CMD_SET_AUTO_SHUTTER 0xc214
+#define AUTO_SHUTTER_SWITCH 0
+#define ERR_NOT_OPEN (-103)
+#define ERR_VC_STATUS (-104)
+#define ERR_VC_TIMEOUT (-105)
+
+static int vc_transfer(uint8_t type, uint8_t request, uint16_t index, void *data, uint16_t length) {
+    struct usbdevfs_ctrltransfer t = {
+        .bRequestType = type, .bRequest = request, .wValue = VC_VALUE, .wIndex = index,
+        .wLength = length, .timeout = 1000, .data = data,
+    };
+    return ioctl(cam.fd, USBDEVFS_CONTROL, &t) < 0 ? -errno : 0;
+}
+
+static int vc_wait_ready(void) {
+    for (int waited = 0; waited < 1000; waited += 2) {
+        uint8_t status = 0xFF;
+        int rc = vc_transfer(VC_IN, VC_READ, VC_STATUS, &status, 1);
+        if (rc) return rc;
+        if ((status & 0x03) == 0) return 0;
+        if (status & 0xFC) {
+            LOGE("vendor command status error 0x%02x", status);
+            return ERR_VC_STATUS;
+        }
+        usleep(2000);
+    }
+    return ERR_VC_TIMEOUT;
+}
+
+/* Long form: cmd LE, p1 BE16, p2 BE32 to 0x9d00; then 8 bytes to 0x1d08 (read length BE32 in
+ * the last four for a read, zeros for a write); poll ready; a read then fetches 0x1d10. */
+static int vc_long(uint16_t cmd, uint16_t p1, uint32_t p2, uint8_t *out, uint16_t out_len) {
+    uint8_t head[8] = {
+        cmd & 0xFF, cmd >> 8, p1 >> 8, p1 & 0xFF, p2 >> 24, (p2 >> 16) & 0xFF, (p2 >> 8) & 0xFF, p2 & 0xFF,
+    };
+    uint8_t tail[8] = {0, 0, 0, 0, 0, 0, out_len >> 8, out_len & 0xFF};
+    int rc;
+    if ((rc = vc_transfer(VC_OUT, VC_WRITE, VC_CMD_LONG, head, sizeof head))) return rc;
+    if ((rc = vc_transfer(VC_OUT, VC_WRITE, VC_DATA, tail, sizeof tail))) return rc;
+    if ((rc = vc_wait_ready())) return rc;
+    return out ? vc_transfer(VC_IN, VC_READ, VC_DATA_LONG, out, out_len) : 0;
+}
+
+/*
+ * Turns the camera's automatic shutter (its periodic flat-field calibration) on or off and reads
+ * the switch back. Returns the switch as read back (0 or 1), or a negative error. The camera only
+ * answers a few seconds after streaming starts, and forgets the setting when it loses power.
+ * Blocks up to a few seconds: call it off the render thread.
+ */
+P2PRO_API int p2pro_set_auto_shutter(int on) {
+    if (cam.fd < 0 || !cam.running) return ERR_NOT_OPEN;
+    int rc = vc_long(CMD_SET_AUTO_SHUTTER, AUTO_SHUTTER_SWITCH, on ? 1 : 0, NULL, 0);
+    if (rc) {
+        LOGE("auto-shutter := %d: error %d", on, rc);
+        return rc;
+    }
+    uint8_t back[2] = {0xFF, 0xFF};
+    if ((rc = vc_long(CMD_GET_AUTO_SHUTTER, AUTO_SHUTTER_SWITCH, 0, back, sizeof back))) {
+        LOGE("auto-shutter read back: error %d", rc);
+        return rc;
+    }
+    int value = back[0] << 8 | back[1];
+    LOGI("auto-shutter := %d, reads back %d", on, value);
+    return value;
 }
 
 /*

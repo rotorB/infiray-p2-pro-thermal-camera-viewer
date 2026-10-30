@@ -244,6 +244,7 @@ namespace P2Pro
                                 new ButtonBar.Button(latency, ToggleLatencyMode),
                                 new ButtonBar.Button("-10 ms", () => NudgeLatency(-LatencyEstimator.StepMs)),
                                 new ButtonBar.Button("+10 ms", () => NudgeLatency(LatencyEstimator.StepMs)),
+                                new ButtonBar.Button(_panel.Thermal.AutoShutterLabel, _panel.Thermal.ToggleAutoShutter),
                             });
                             break;
                     }
@@ -745,8 +746,8 @@ namespace P2Pro
                           (_flashlight.On ? "  FLASHLIGHT" : "") +
                           (_style.Look == OverlayStyle.LookKind.Edges && _roomMode == RoomMode.Paint ? "  (edges: Live / Flat only)" : ""));
             if (_state is State.Frozen or State.Points) sb.AppendLine("Thermal: frozen");
-            else if (t.FrameCount == 0 || _thermalFps == 0) sb.AppendLine("Thermal: " + t.Status);
-            else sb.AppendLine($"Thermal {_thermalFps} fps   min {t.Min:F1}  max {t.Max:F1}  centre {t.Center:F1} C");
+            else if (t.FrameCount == 0 || _thermalFps == 0 && !t.ShutterActive) sb.AppendLine("Thermal: " + t.Status);
+            else sb.AppendLine($"Thermal {_thermalFps} fps   min {t.Min:F1}  max {t.Max:F1}  centre {t.Center:F1} C" + Shutter(t));
             sb.AppendLine($"Distance {(_distance > 0 ? $"{_distance:F2} m" : "-")}   RGB {_rgbFps} fps");
             if (_roomMode == RoomMode.Paint)
                 sb.AppendLine($"Painted {_map.Baked} frames" + (_map.Skipped.Length > 0 ? $"  ({_map.Skipped})" : ""));
@@ -757,6 +758,8 @@ namespace P2Pro
             sb.Append("Look at a controller for its buttons");
             return sb.ToString();
         }
+
+        static string Shutter(ThermalCamera t) => t.ShutterActive ? "   SHUTTER" : "";
 
         string Status()
         {

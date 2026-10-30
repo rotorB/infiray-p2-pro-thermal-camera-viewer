@@ -218,6 +218,17 @@ warping a 2D image.
   Paint 86, Flat 88 fps; the rest are the scan's 3 + 1 GPU bursts a second.
   Edge scoring only while calibrating. Switches for foveation, resolution, MSAA, display rate,
   scan rate, paint keyframes.
+- [x] Shutter (flat-field calibration): while the camera's shutter is closed (11-12 frames,
+  ~0.5 s, every ~15 s while warming up, 60 s later) it repeats its last frame with fresh arrival
+  times, so the old picture was projected with newer head poses and slid across the room.
+  Dropping the repeats and holding frames after them did not stop the slide, so the automatic
+  shutter can be switched off instead: `set_prop_auto_shutter_params` (0xc214, PROP_SWITCH = 0,
+  read back with 0x8214; from stanelie/p2-viewer, extracted from the official app's
+  libircmd.so) through the vendor control channel in `raw_uvc.c`. Written 12 s after every
+  stream start, after the camera's two startup calibrations (it forgets the switch when it loses
+  power; nothing is written to flash). Setup tab switches it back on. Nothing ever triggers a
+  calibration. Tried off: no more clicks, but temperatures drifted as the sensor warmed, so
+  auto stays the default and off is a Setup choice.
 - [ ] Subtract, difference, overlay blend modes, if needed.
 
 ## Phase 4: Supervision 2 (thermal room mesh)
