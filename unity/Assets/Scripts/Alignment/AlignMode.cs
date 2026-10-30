@@ -22,7 +22,7 @@ namespace P2Pro
     /// </list>
     /// Sticks while frozen: left = move, right up / down = size, right left / right = turn,
     /// hold a grip = fine steps. Y while viewing = next room mode (live, paint, flat); X = thermal
-    /// surfaces / thermal wireframe.
+    /// surfaces / thermal wireframe; B = HUD (<see cref="Hud"/>).
     /// </summary>
     public class AlignMode : MonoBehaviour
     {
@@ -99,6 +99,7 @@ namespace P2Pro
             _wizard = gameObject.AddComponent<PointsWizard>();
             _wizard.Init(panel, _alignment, buttons, _probe);
             panel.SceneRange = () => _map.SceneRange;
+            gameObject.AddComponent<Hud>().Init(panel, HudText);
             SetRoomMode((RoomMode)PlayerPrefs.GetInt(RoomModeKey, (int)RoomMode.Paint));
             Debug.Log($"[P2Pro] alignment: {_alignment.Points.Count} points from {ThermalAlignment.FilePath}; lens " +
                       (_alignment.Lens.Solved ? _alignment.Lens.ToString() : $"not solved ({_alignment.Lens.Pairs.Count} pairs)"));
@@ -147,12 +148,15 @@ namespace P2Pro
                     }, new[]
                     {
                         new ButtonBar.Button(_style.BlendLabel, _style.NextBlend),
-                        new ButtonBar.Button(_style.OpacityLabel, _style.NextOpacity),
                         new ButtonBar.Button(_style.FilterLabel, () => _style.NextFilter(_panel.RangeMin, _panel.RangeMax)),
-                        new ButtonBar.Button("Thr -1 C", () => _style.NudgeThreshold(-1)),
-                        new ButtonBar.Button("Thr +1 C", () => _style.NudgeThreshold(1)),
                         new ButtonBar.Button(_style.WireLabel, _style.ToggleWire),
-                    });
+                    }, new[]
+                    {
+                        ButtonBar.Button.Slider(() => _style.Threshold, _style.SetThreshold,
+                            _panel.RangeMin, _panel.RangeMax, _ => _style.ThresholdLabel),
+                        ButtonBar.Button.Slider(() => _style.Opacity, _style.SetOpacity,
+                            OverlayStyle.MinOpacity, 1, v => $"Opacity {v * 100:F0}%"),
+                    }, RangeSliders());
                     break;
                 case State.Calibrate:
                     bool confirming = Time.unscaledTime < _confirmResetUntil;
@@ -189,6 +193,24 @@ namespace P2Pro
                     });
                     break;
             }
+        }
+
+        // Min and max of the palette (switch the range to Manual). Their span covers what the
+        // camera and the room show, with a margin, so a slider has room to move both ways.
+        ButtonBar.Button[] RangeSliders()
+        {
+            var t = _panel.Thermal;
+            float lo = Mathf.Min(_panel.RangeMin, t.Min), hi = Mathf.Max(_panel.RangeMax, t.Max);
+            if (_map.SceneRange is { } scene) { lo = Mathf.Min(lo, scene.x); hi = Mathf.Max(hi, scene.y); }
+            lo = Mathf.Floor(lo - 5);
+            hi = Mathf.Ceil(hi + 5);
+            return new[]
+            {
+                ButtonBar.Button.Slider(() => _panel.RangeMin, v => _panel.SetManualRange(Mathf.Min(v, _panel.RangeMax - 0.5f), _panel.RangeMax),
+                    lo, hi, v => $"Palette min {v:F1} C"),
+                ButtonBar.Button.Slider(() => _panel.RangeMax, v => _panel.SetManualRange(_panel.RangeMin, Mathf.Max(v, _panel.RangeMin + 0.5f)),
+                    lo, hi, v => $"Palette max {v:F1} C"),
+            };
         }
 
         void SetState(State state)
@@ -466,6 +488,27 @@ namespace P2Pro
             _rgbFrames = _panel.Rgb.FrameCount;
         }
 
+        // A few lines for the HUD: modes, the camera's readings, how the room is painted.
+        string HudText()
+        {
+            var t = _panel.Thermal;
+            var sb = new StringBuilder();
+            string room = _roomMode switch
+            {
+                RoomMode.Live => "LIVE", RoomMode.Paint => "PAINT", RoomMode.Flat => "FLAT", _ => "OFF",
+            };
+            sb.AppendLine($"{room}  {(_style.Wire ? "wire" : "surface")}  {_panel.PaletteName}  {_panel.RangeName}");
+            if (_state is State.Frozen or State.Points) sb.AppendLine("Thermal: frozen");
+            else if (t.FrameCount == 0 || _thermalFps == 0) sb.AppendLine("Thermal: " + t.Status);
+            else sb.AppendLine($"Thermal {_thermalFps} fps   min {t.Min:F1}  max {t.Max:F1}  centre {t.Center:F1} C");
+            sb.AppendLine($"Distance {(_distance > 0 ? $"{_distance:F2} m" : "-")}   RGB {_rgbFps} fps");
+            if (_roomMode == RoomMode.Paint)
+                sb.AppendLine($"Painted {_map.Baked} frames" + (_map.Skipped.Length > 0 ? $"  ({_map.Skipped})" : ""));
+            sb.AppendLine(_alignment.Lens.Solved ? $"Lens {_alignment.Lens.RmsPx:F1} px" : $"Mapping {_alignment.Points.Count} points");
+            sb.Append("Y mode  X wire  sticks palette / range  B hide");
+            return sb.ToString();
+        }
+
         string Status()
         {
             var t = _panel.Thermal;
@@ -475,7 +518,7 @@ namespace P2Pro
                 : $"{_thermalFps} fps, {t.Min:F1}..{t.Max:F1} C";
             string depth = _distance > 0 ? $"{_distance:F2} m" : "no depth yet";
             sb.AppendLine($"Thermal: {thermal}    RGB: {_rgbFps} fps    Distance to centre of view: {depth}");
-            sb.AppendLine("Calibration: " + Points() + "    Menu = hide / show panel    Y = room mode    X = wire    Point a controller anywhere = its temperature");
+            sb.AppendLine("Calibration: " + Points() + "    Menu = hide / show panel    Y = room mode    X = wire    B = HUD    Point a controller anywhere = its temperature");
 
             switch (_state)
             {

@@ -5,15 +5,16 @@ namespace P2Pro
 {
     /// <summary>
     /// How the thermal overlay on the room mesh is blended with the room (P2ProOverlay.hlsl):
-    /// blend mode, opacity, a hot-only / cold-only temperature filter and surfaces or wireframe
-    /// edges. Remembered between launches, except the wireframe: every launch starts on surfaces.
+    /// blend mode, opacity (slider), a hot-only / cold-only temperature filter with its threshold
+    /// (slider) and surfaces or wireframe edges. Remembered between launches, except the
+    /// wireframe: every launch starts on surfaces.
     /// </summary>
     public class OverlayStyle
     {
         public enum BlendKind { Alpha, Add, Screen, Multiply }
         public enum FilterKind { All, Hot, Cold }
 
-        static readonly float[] Opacities = { 0.25f, 0.5f, 0.75f, 1 };
+        public const float MinOpacity = 0.1f;
         static readonly int AlphaId = Shader.PropertyToID("_Alpha");
         static readonly int ModeId = Shader.PropertyToID("_Mode");
         static readonly int FilterId = Shader.PropertyToID("_Filter");
@@ -26,26 +27,25 @@ namespace P2Pro
         const string Key = "p2pro.overlay.";
 
         public BlendKind Blend { get; private set; }
-        public float Opacity => Opacities[_opacity];
+        public float Opacity { get; private set; }
         public FilterKind Filter { get; private set; }
         public float Threshold { get; private set; }
         /// <summary>Draws only the mesh's triangle edges, each coloured by its temperature.</summary>
         public bool Wire { get; private set; }
 
-        int _opacity;
         bool _thresholdSet;
 
         public OverlayStyle()
         {
             Blend = (BlendKind)PlayerPrefs.GetInt(Key + "blend", 0);
-            _opacity = Mathf.Clamp(PlayerPrefs.GetInt(Key + "opacity", 2), 0, Opacities.Length - 1);
+            Opacity = Mathf.Clamp(PlayerPrefs.GetFloat(Key + "opacityValue", 0.75f), MinOpacity, 1);
             Filter = (FilterKind)PlayerPrefs.GetInt(Key + "filter", 0);
             Threshold = PlayerPrefs.GetFloat(Key + "threshold", 30);
             _thresholdSet = PlayerPrefs.HasKey(Key + "threshold");
         }
 
         public void NextBlend() { Blend = (BlendKind)(((int)Blend + 1) % 4); Save(); }
-        public void NextOpacity() { _opacity = (_opacity + 1) % Opacities.Length; Save(); }
+        public void SetOpacity(float opacity) { Opacity = Mathf.Clamp(opacity, MinOpacity, 1); Save(); }
         public void ToggleWire() => Wire = !Wire;
 
         /// <summary>All -> hot -> cold. The first time, the threshold starts at 3/4 of the range.</summary>
@@ -60,15 +60,23 @@ namespace P2Pro
             Save();
         }
 
-        public void NudgeThreshold(float celsius)
+        /// <summary>Sets the threshold; with the filter off, it turns to hot-only so the change shows.</summary>
+        public void SetThreshold(float celsius)
         {
-            Threshold += celsius;
+            Threshold = celsius;
             _thresholdSet = true;
+            if (Filter == FilterKind.All) Filter = FilterKind.Hot;
             Save();
         }
 
+        public string ThresholdLabel => Filter switch
+        {
+            FilterKind.Cold => $"Threshold: below {Threshold:F1} C",
+            FilterKind.Hot => $"Threshold: above {Threshold:F1} C",
+            _ => $"Threshold {Threshold:F1} C (drag = hot only)",
+        };
+
         public string BlendLabel => "Blend: " + Blend.ToString().ToLowerInvariant();
-        public string OpacityLabel => $"Opacity {Opacity * 100:F0}%";
         public string WireLabel => Wire ? "Mesh: wire" : "Mesh: surface";
         public string FilterLabel => Filter switch
         {
@@ -99,7 +107,7 @@ namespace P2Pro
         void Save()
         {
             PlayerPrefs.SetInt(Key + "blend", (int)Blend);
-            PlayerPrefs.SetInt(Key + "opacity", _opacity);
+            PlayerPrefs.SetFloat(Key + "opacityValue", Opacity);
             PlayerPrefs.SetInt(Key + "filter", (int)Filter);
             PlayerPrefs.SetFloat(Key + "threshold", Threshold);
             PlayerPrefs.Save();

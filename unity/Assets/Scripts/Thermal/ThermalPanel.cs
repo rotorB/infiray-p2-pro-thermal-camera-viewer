@@ -13,8 +13,9 @@ namespace P2Pro
     /// </summary>
     public class ThermalPanel : MonoBehaviour
     {
-        enum RangeMode { Frame, Room, Wide, Scene }
-        static readonly string[] RangeNames = { "Frame", "Room 15-35", "Wide", "Scene" };
+        enum RangeMode { Frame, Manual, Wide, Scene }
+        static readonly string[] RangeNames = { "Frame", "Manual", "Wide", "Scene" };
+        const string ManualKey = "p2pro.range.";
         static readonly RangeMode[] QuickRanges = { RangeMode.Scene, RangeMode.Frame, RangeMode.Wide };   // left stick
 
         const float PanelWidth = 0.4f;
@@ -65,6 +66,7 @@ namespace P2Pro
         RangeMode _range = RangeMode.Scene;     // falls back to Frame until the map has data
         float _autoMin = float.NaN;
         float _autoMax = float.NaN;
+        float _manualMin, _manualMax;           // the Manual range, set with the sliders
         bool _placed;
         bool _thermalShown;
         RenderTexture _frozenRgb;
@@ -103,7 +105,9 @@ namespace P2Pro
 
             var text = PanelText.Create(_panel, new Vector3(-PanelWidth - Gap / 2, -PanelWidth * _aspect / 2 - Gap, 0), "Status");
             var buttons = gameObject.AddComponent<ButtonBar>();
-            buttons.Init(_panel, new Vector3(0, PanelWidth * _aspect / 2 + 0.15f, 0), 2 * PanelWidth + Gap);  // up to three rows
+            buttons.Init(_panel, new Vector3(0, PanelWidth * _aspect / 2 + 0.04f, 0), 2 * PanelWidth + Gap);  // bottom row; others above
+            _manualMin = PlayerPrefs.GetFloat(ManualKey + "min", 15);
+            _manualMax = PlayerPrefs.GetFloat(ManualKey + "max", 35);
             gameObject.AddComponent<AlignMode>().Init(this, text, buttons);
         }
 
@@ -228,6 +232,17 @@ namespace P2Pro
         // From a range missing in the quick order (Room) the next is the first.
         void NextQuickRange() => SetRange(QuickRanges[(Array.IndexOf(QuickRanges, _range) + 1) % QuickRanges.Length]);
 
+        /// <summary>Switches to the Manual range from <paramref name="min"/> to <paramref name="max"/> °C (remembered).</summary>
+        public void SetManualRange(float min, float max)
+        {
+            _range = RangeMode.Manual;
+            _manualMin = min;
+            _manualMax = Mathf.Max(max, min + 0.5f);
+            PlayerPrefs.SetFloat(ManualKey + "min", _manualMin);
+            PlayerPrefs.SetFloat(ManualKey + "max", _manualMax);
+            ApplyRange(_manualMin, _manualMax);         // at once, also while frozen
+        }
+
         void SetRange(RangeMode range)
         {
             _range = range;
@@ -278,7 +293,7 @@ namespace P2Pro
             float lo, hi;
             switch (_range)
             {
-                case RangeMode.Room: lo = 15; hi = 35; break;
+                case RangeMode.Manual: lo = _manualMin; hi = _manualMax; break;
                 case RangeMode.Wide: lo = -20; hi = 150; break;
                 default:
                     // Frame: this frame's min / max; Scene: the room map's percentiles. Smooth the
@@ -291,6 +306,11 @@ namespace P2Pro
                     hi = Mathf.Max(_autoMax, _autoMin + 0.5f);
                     break;
             }
+            ApplyRange(lo, hi);
+        }
+
+        void ApplyRange(float lo, float hi)
+        {
             RangeMin = lo;
             RangeMax = hi;
             _material.SetFloat(MinId, lo);

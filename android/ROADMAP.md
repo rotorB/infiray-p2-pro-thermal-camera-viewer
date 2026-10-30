@@ -149,14 +149,18 @@ warping a 2D image.
   Hot spots).
 - [x] Controller shortcuts: Y = room mode (live, paint, flat), X = thermal surfaces / thermal
   wireframe (hair-thin, antialiased, coloured by °C; starts on surfaces), right stick click =
-  palette, left stick click = range (Scene, Frame, Wide).
+  palette, left stick click = range (Scene, Frame, Wide), B = HUD (modes, readings, palette
+  bar; follows the head, remembered).
 - [x] QuestRoomScan's own mesh (RGB colours, white grid) is hidden; a depth-only pass of the
   same mesh keeps the thermal overlays on the nearest surface.
 - [x] Overlay style (`OverlayStyle`, `P2ProOverlay.hlsl`), saved between launches:
   - blend: alpha, add, screen, multiply;
-  - opacity 25 / 50 / 75 / 100 %;
-  - show all, only above or only below a threshold (+-1 °C buttons);
+  - opacity slider (10-100 %);
+  - show all, only above or only below a threshold (slider over the palette range; dragging
+    it with the filter off turns on hot-only);
   - greyscale through the White hot / Black hot palettes.
+- [x] Pointer sliders in `ButtonBar` (point, hold the trigger, drag): threshold, opacity,
+  palette min / max (switch the range to Manual, remembered; replaces the fixed 15-35 range).
 - [ ] Subtract, difference, overlay blend modes, if needed.
 
 ## Phase 4: Supervision 2 (thermal room mesh)
