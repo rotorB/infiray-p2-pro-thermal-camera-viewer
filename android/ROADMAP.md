@@ -161,6 +161,12 @@ warping a 2D image.
   - greyscale through the White hot / Black hot palettes.
 - [x] Pointer sliders in `ButtonBar` (point, hold the trigger, drag): threshold, opacity,
   palette min / max (switch the range to Manual, remembered; replaces the fixed 15-35 range).
+- [x] Panel tabs (remembered): View (room mode, clear map, palette, range, palette min / max),
+  Style (blend, show filter, wire, threshold, opacity, sharpness 0-10 with 0 = off),
+  Setup (calibrate, recenter, even, latency). At most three rows.
+- [x] Thermal flashlight (`ThermalFlashlight`): A toggles it; while on, Live, Paint and Flat
+  show thermal only inside a soft-edged cone from the right controller (half-angle 3-45 deg,
+  slider in the View tab). Starts off every launch.
 - [ ] Subtract, difference, overlay blend modes, if needed.
 
 ## Phase 4: Supervision 2 (thermal room mesh)

@@ -114,7 +114,7 @@ namespace P2Pro
                 }
             }
             for (int i = next; i < _slots.Count; i++) _slots[i].Root.SetActive(false);
-            if (_drag != null && !_drag.Root.activeSelf) _drag = null;
+            if (_drag != null && (!_drag.Root.activeSelf || !_drag.Button.IsSlider)) _drag = null;
         }
 
         // Fill up to the value, the handle on it, and the label.

@@ -105,7 +105,7 @@ Shader "P2Pro/ThermalLive"
                 if (!ThermalUvOf(c, _RgbIntrinsics, _RgbCrop, _MapA, _MapB, uv) || any(uv < 0) || any(uv > 1)) discard;
                 float celsius = Celsius(uv);
                 float k = saturate((celsius - _Min) / max(_Max - _Min, 0.01));
-                return OverlayColour(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(k, 0.5)).rgb, celsius, coverage);
+                return OverlayColour(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(k, 0.5)).rgb, celsius, coverage, i.positionWS);
             }
             ENDHLSL
         }

@@ -51,6 +51,7 @@ Shader "P2Pro/ThermalFlat"
             {
                 float4 positionCS : SV_POSITION;
                 float2 uv : TEXCOORD0;
+                float3 positionWS : TEXCOORD1;
                 UNITY_VERTEX_OUTPUT_STEREO
             };
 
@@ -59,7 +60,8 @@ Shader "P2Pro/ThermalFlat"
                 Varyings o;
                 UNITY_SETUP_INSTANCE_ID(v);
                 UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
-                o.positionCS = TransformObjectToHClip(v.positionOS.xyz);
+                o.positionWS = TransformObjectToWorld(v.positionOS.xyz);
+                o.positionCS = TransformWorldToHClip(o.positionWS);
                 o.uv = v.uv;
                 return o;
             }
@@ -84,7 +86,7 @@ Shader "P2Pro/ThermalFlat"
             {
                 float celsius = Celsius(i.uv);
                 float k = saturate((celsius - _Min) / max(_Max - _Min, 0.01));
-                return OverlayColour(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(k, 0.5)).rgb, celsius);
+                return OverlayColour(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(k, 0.5)).rgb, celsius, 1, i.positionWS);
             }
             ENDHLSL
         }

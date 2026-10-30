@@ -22,11 +22,16 @@ namespace P2Pro
     /// </list>
     /// Sticks while frozen: left = move, right up / down = size, right left / right = turn,
     /// hold a grip = fine steps. Y while viewing = next room mode (live, paint, flat); X = thermal
-    /// surfaces / thermal wireframe; B = HUD (<see cref="Hud"/>).
+    /// surfaces / thermal wireframe; B = HUD (<see cref="Hud"/>); A = thermal flashlight
+    /// (<see cref="ThermalFlashlight"/>).
     /// </summary>
     public class AlignMode : MonoBehaviour
     {
         enum State { View, Calibrate, Frozen, Points }
+        // Tabs of the View panel; stored in PlayerPrefs, append only.
+        enum Tab { View, Style, Setup }
+        static readonly string[] TabNames = { "View", "Style", "Setup" };
+        const string TabKey = "p2pro.panelTab";
         // Values are stored in PlayerPrefs: append new modes, do not reorder.
         enum RoomMode { Live, Paint, Off, Flat }
         static readonly string[] RoomModeNames = { "Room: live", "Room: paint + keep", "Room: off", "Flat: no 3D" };
@@ -60,8 +65,10 @@ namespace P2Pro
         readonly TargetFinder _finder = new();
         ThermalAlignment _alignment;
         PointsWizard _wizard;
+        ThermalFlashlight _flashlight;
 
         State _state;
+        Tab _tab;
         float _distance = -1;
         float _nextProbe;
         float _nextText;
@@ -100,7 +107,9 @@ namespace P2Pro
             _wizard.Init(panel, _alignment, buttons, _probe);
             panel.SceneRange = () => _map.SceneRange;
             gameObject.AddComponent<Hud>().Init(panel, HudText);
+            _flashlight = gameObject.AddComponent<ThermalFlashlight>();
             SetRoomMode((RoomMode)PlayerPrefs.GetInt(RoomModeKey, (int)RoomMode.Paint));
+            _tab = (Tab)Mathf.Clamp(PlayerPrefs.GetInt(TabKey, 0), 0, TabNames.Length - 1);
             Debug.Log($"[P2Pro] alignment: {_alignment.Points.Count} points from {ThermalAlignment.FilePath}; lens " +
                       (_alignment.Lens.Solved ? _alignment.Lens.ToString() : $"not solved ({_alignment.Lens.Pairs.Count} pairs)"));
         }
@@ -130,33 +139,48 @@ namespace P2Pro
                     string latency = _latency.Auto
                         ? $"Latency {_latency.LatencyMs:F0} ms auto"
                         : $"Latency {_latency.LatencyMs:F0} ms manual";
-                    _buttons.Show(new[]
+                    switch (_tab)
                     {
-                        new ButtonBar.Button("Calibrate", () => SetState(State.Calibrate), !_alignment.Ready),
-                        new ButtonBar.Button(RoomModeNames[(int)_roomMode], () => NextRoomMode(RoomModeOrder)),
-                        new ButtonBar.Button("Clear map", _map.Clear),
-                        new ButtonBar.Button("Palette: " + _panel.PaletteName, _panel.NextPalette),
-                        new ButtonBar.Button("Range: " + _panel.RangeName, _panel.NextRange),
-                    }, new[]
-                    {
-                        new ButtonBar.Button(latency, ToggleLatencyMode),
-                        new ButtonBar.Button("-10 ms", () => NudgeLatency(-LatencyEstimator.StepMs)),
-                        new ButtonBar.Button("+10 ms", () => NudgeLatency(LatencyEstimator.StepMs)),
-                        new ButtonBar.Button("Recenter panel", _panel.PlaceInFrontOfHead),
-                        new ButtonBar.Button(_panel.Sharpening.Label, ToggleSharpening),
-                        new ButtonBar.Button(_panel.FlatField.Label, ToggleFlatField),
-                    }, new[]
-                    {
-                        new ButtonBar.Button(_style.BlendLabel, _style.NextBlend),
-                        new ButtonBar.Button(_style.FilterLabel, () => _style.NextFilter(_panel.RangeMin, _panel.RangeMax)),
-                        new ButtonBar.Button(_style.WireLabel, _style.ToggleWire),
-                    }, new[]
-                    {
-                        ButtonBar.Button.Slider(() => _style.Threshold, _style.SetThreshold,
-                            _panel.RangeMin, _panel.RangeMax, _ => _style.ThresholdLabel),
-                        ButtonBar.Button.Slider(() => _style.Opacity, _style.SetOpacity,
-                            OverlayStyle.MinOpacity, 1, v => $"Opacity {v * 100:F0}%"),
-                    }, RangeSliders());
+                        case Tab.View:
+                            _buttons.Show(TabRow(), new[]
+                            {
+                                new ButtonBar.Button(RoomModeNames[(int)_roomMode], () => NextRoomMode(RoomModeOrder)),
+                                new ButtonBar.Button("Clear map", _map.Clear),
+                                new ButtonBar.Button("Palette: " + _panel.PaletteName, _panel.NextPalette),
+                                new ButtonBar.Button("Range: " + _panel.RangeName, _panel.NextRange),
+                                new ButtonBar.Button(_flashlight.Label, _flashlight.Toggle, _flashlight.On),
+                            }, RangeSliders());
+                            break;
+                        case Tab.Style:
+                            _buttons.Show(TabRow(), new[]
+                            {
+                                new ButtonBar.Button(_style.BlendLabel, _style.NextBlend),
+                                new ButtonBar.Button(_style.FilterLabel, () => _style.NextFilter(_panel.RangeMin, _panel.RangeMax)),
+                                new ButtonBar.Button(_style.WireLabel, _style.ToggleWire),
+                            }, new[]
+                            {
+                                ButtonBar.Button.Slider(() => _style.Threshold, _style.SetThreshold,
+                                    _panel.RangeMin, _panel.RangeMax, _ => _style.ThresholdLabel),
+                                ButtonBar.Button.Slider(() => _style.Opacity, _style.SetOpacity,
+                                    OverlayStyle.MinOpacity, 1, v => $"Opacity {v * 100:F0}%"),
+                                ButtonBar.Button.Slider(() => _panel.Sharpening.Strength, v => _panel.Sharpening.Strength = v,
+                                    0, ThermalSharpening.MaxStrength, _ => _panel.Sharpening.Label),
+                            });
+                            break;
+                        default:
+                            _buttons.Show(TabRow(), new[]
+                            {
+                                new ButtonBar.Button("Calibrate", () => SetState(State.Calibrate), !_alignment.Ready),
+                                new ButtonBar.Button("Recenter panel", _panel.PlaceInFrontOfHead),
+                                new ButtonBar.Button(_panel.FlatField.Label, ToggleFlatField),
+                            }, new[]
+                            {
+                                new ButtonBar.Button(latency, ToggleLatencyMode),
+                                new ButtonBar.Button("-10 ms", () => NudgeLatency(-LatencyEstimator.StepMs)),
+                                new ButtonBar.Button("+10 ms", () => NudgeLatency(LatencyEstimator.StepMs)),
+                            });
+                            break;
+                    }
                     break;
                 case State.Calibrate:
                     bool confirming = Time.unscaledTime < _confirmResetUntil;
@@ -195,6 +219,27 @@ namespace P2Pro
             }
         }
 
+        // Tab selector, the current tab lit; Setup asks for attention until the camera is aligned.
+        ButtonBar.Button[] TabRow()
+        {
+            var row = new ButtonBar.Button[TabNames.Length];
+            for (int i = 0; i < row.Length; i++)
+            {
+                var tab = (Tab)i;
+                string label = tab == Tab.Setup && !_alignment.Ready ? "Setup: calibrate!" : TabNames[i];
+                row[i] = new ButtonBar.Button(_tab == tab ? $"[ {label} ]" : label, () => SetTab(tab), _tab == tab);
+            }
+            return row;
+        }
+
+        void SetTab(Tab tab)
+        {
+            _tab = tab;
+            PlayerPrefs.SetInt(TabKey, (int)tab);
+            PlayerPrefs.Save();
+            _nextText = 0;
+        }
+
         // Min and max of the palette (switch the range to Manual). Their span covers what the
         // camera and the room show, with a margin, so a slider has room to move both ways.
         ButtonBar.Button[] RangeSliders()
@@ -206,6 +251,8 @@ namespace P2Pro
             hi = Mathf.Ceil(hi + 5);
             return new[]
             {
+                ButtonBar.Button.Slider(() => _flashlight.Angle, v => _flashlight.Angle = v,
+                    ThermalFlashlight.MinAngle, ThermalFlashlight.MaxAngle, v => $"Flashlight cone {v:F0} deg"),
                 ButtonBar.Button.Slider(() => _panel.RangeMin, v => _panel.SetManualRange(Mathf.Min(v, _panel.RangeMax - 0.5f), _panel.RangeMax),
                     lo, hi, v => $"Palette min {v:F1} C"),
                 ButtonBar.Button.Slider(() => _panel.RangeMax, v => _panel.SetManualRange(_panel.RangeMin, Mathf.Max(v, _panel.RangeMin + 0.5f)),
@@ -247,12 +294,6 @@ namespace P2Pro
         void ToggleFlatField()
         {
             _panel.FlatField.Enabled = !_panel.FlatField.Enabled;
-            _nextText = 0;
-        }
-
-        void ToggleSharpening()
-        {
-            _panel.Sharpening.Enabled = !_panel.Sharpening.Enabled;
             _nextText = 0;
         }
 
@@ -497,7 +538,8 @@ namespace P2Pro
             {
                 RoomMode.Live => "LIVE", RoomMode.Paint => "PAINT", RoomMode.Flat => "FLAT", _ => "OFF",
             };
-            sb.AppendLine($"{room}  {(_style.Wire ? "wire" : "surface")}  {_panel.PaletteName}  {_panel.RangeName}");
+            sb.AppendLine($"{room}  {(_style.Wire ? "wire" : "surface")}  {_panel.PaletteName}  {_panel.RangeName}" +
+                          (_flashlight.On ? "  FLASHLIGHT" : ""));
             if (_state is State.Frozen or State.Points) sb.AppendLine("Thermal: frozen");
             else if (t.FrameCount == 0 || _thermalFps == 0) sb.AppendLine("Thermal: " + t.Status);
             else sb.AppendLine($"Thermal {_thermalFps} fps   min {t.Min:F1}  max {t.Max:F1}  centre {t.Center:F1} C");
@@ -505,7 +547,7 @@ namespace P2Pro
             if (_roomMode == RoomMode.Paint)
                 sb.AppendLine($"Painted {_map.Baked} frames" + (_map.Skipped.Length > 0 ? $"  ({_map.Skipped})" : ""));
             sb.AppendLine(_alignment.Lens.Solved ? $"Lens {_alignment.Lens.RmsPx:F1} px" : $"Mapping {_alignment.Points.Count} points");
-            sb.Append("Y mode  X wire  sticks palette / range  B hide");
+            sb.Append("Y mode  X wire  A flashlight  sticks palette / range  B hide");
             return sb.ToString();
         }
 
@@ -518,12 +560,12 @@ namespace P2Pro
                 : $"{_thermalFps} fps, {t.Min:F1}..{t.Max:F1} C";
             string depth = _distance > 0 ? $"{_distance:F2} m" : "no depth yet";
             sb.AppendLine($"Thermal: {thermal}    RGB: {_rgbFps} fps    Distance to centre of view: {depth}");
-            sb.AppendLine("Calibration: " + Points() + "    Menu = hide / show panel    Y = room mode    X = wire    B = HUD    Point a controller anywhere = its temperature");
+            sb.AppendLine("Calibration: " + Points() + "    Menu = hide / show panel    Y = room mode    X = wire    A = flashlight    B = HUD    Point a controller anywhere = its temperature");
 
             switch (_state)
             {
                 case State.View when !_alignment.Ready:
-                    sb.AppendLine("Not calibrated yet. Point at Calibrate and pull the trigger.");
+                    sb.AppendLine("Not calibrated yet. Open the Setup tab and press Calibrate.");
                     break;
                 case State.View:
                     string scene = _map.SceneRange is { } r ? $"{r.x:F1}..{r.y:F1} C" : "nothing yet";

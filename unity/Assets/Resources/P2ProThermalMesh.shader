@@ -179,7 +179,7 @@ Shader "P2Pro/ThermalMesh"
                 }
                 if (frameWeights > 1e-5) celsius = frameSum / frameWeights;
                 float k = saturate((celsius - _Min) / max(_Max - _Min, 0.01));
-                return OverlayColour(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(k, 0.5)).rgb, celsius, coverage);
+                return OverlayColour(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(k, 0.5)).rgb, celsius, coverage, i.positionWS);
             }
             ENDHLSL
         }

@@ -8,14 +8,17 @@ namespace P2Pro
     /// mode): 3x bilinear upsample, then an unsharp mask with a Gaussian of sigma 1.2 upsampled
     /// pixels (P2ProSharpen.compute). Runs on °C on every new frame; <see cref="Output"/> is
     /// what the panel and the room overlays show. <see cref="ThermalCamera.Celsius"/> stays
-    /// unsharpened for measurements. On/off is remembered between launches.
+    /// unsharpened for measurements. <see cref="Strength"/> (0-10, 0 = off) is remembered
+    /// between launches.
     /// </summary>
     public class ThermalSharpening : MonoBehaviour
     {
         public const int Upscale = 3;
-        public const float Strength = 4;
+        public const float MaxStrength = 10;
+        const float DefaultStrength = 4;
         const float Sigma = 1.2f;
-        const string Key = "p2pro.sharpen";
+        const string Key = "p2pro.sharpen";                     // old on/off
+        const string StrengthKey = "p2pro.sharpenStrength";
 
         static readonly int SourceId = Shader.PropertyToID("_Source");
         static readonly int UpId = Shader.PropertyToID("_Up");
@@ -33,31 +36,33 @@ namespace P2Pro
         ComputeShader _shader;
         int _upsample, _blurX, _sharpen;
         RenderTexture _up, _tmp, _result;
-        bool _enabled;
+        float _strength;
+        bool Enabled => _strength > 0.05f;
 
         /// <summary>Sharpened °C at <see cref="Upscale"/> x the camera resolution, or the camera's own texture when off.</summary>
-        public Texture Output => _enabled && _result != null ? _result : _thermal.Temperature;
+        public Texture Output => Enabled && _result != null ? _result : _thermal.Temperature;
 
-        public bool Enabled
+        /// <summary>Unsharp mask amount, 0 (off, the camera's own image) to <see cref="MaxStrength"/>.</summary>
+        public float Strength
         {
-            get => _enabled;
+            get => _strength;
             set
             {
-                _enabled = value;
-                PlayerPrefs.SetInt(Key, value ? 1 : 0);
-                PlayerPrefs.Save();
+                _strength = Mathf.Clamp(value, 0, MaxStrength);
+                PlayerPrefs.SetFloat(StrengthKey, _strength);
+                _shader.SetFloat(StrengthId, _strength);
                 // A frozen frame gets no new FrameReady, so sharpen it now.
-                if (value && _thermal.FrameCount > 0) Process();
+                if (Enabled && _thermal.FrameCount > 0) Process();
             }
         }
 
-        public string Label => _enabled ? $"Sharpen: {Strength:F0}" : "Sharpen: off";
+        public string Label => Enabled ? $"Sharpness {_strength:F1}" : "Sharpness: off";
 
         /// <summary>Subscribe before anything that reads <see cref="Output"/> on FrameReady.</summary>
         public void Init(ThermalCamera thermal)
         {
             _thermal = thermal;
-            _enabled = PlayerPrefs.GetInt(Key, 1) == 1;
+            _strength = PlayerPrefs.GetFloat(StrengthKey, PlayerPrefs.GetInt(Key, 1) == 1 ? DefaultStrength : 0);
             _shader = Resources.Load<ComputeShader>("P2ProSharpen");
             _upsample = _shader.FindKernel("Upsample");
             _blurX = _shader.FindKernel("BlurX");
@@ -77,7 +82,7 @@ namespace P2Pro
             _shader.SetInts(SizeId, w, h);
             _shader.SetFloat(SigmaId, Sigma);
             _shader.SetInt(RadiusId, 4);         // OpenCV's kernel for sigma 1.2 is 9 taps
-            _shader.SetFloat(StrengthId, Strength);
+            _shader.SetFloat(StrengthId, _strength);
             _thermal.FrameReady += OnFrame;
         }
 
@@ -97,7 +102,7 @@ namespace P2Pro
 
         void OnFrame()
         {
-            if (_enabled) Process();
+            if (Enabled) Process();
         }
 
         void Process()
@@ -111,6 +116,7 @@ namespace P2Pro
 
         void OnDestroy()
         {
+            PlayerPrefs.Save();
             if (_thermal != null) _thermal.FrameReady -= OnFrame;
             if (_up != null) _up.Release();
             if (_tmp != null) _tmp.Release();
