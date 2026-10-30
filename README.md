@@ -9,8 +9,8 @@ Real-time thermal imaging desktop app for the **Infiray P2 Pro** USB camera. Cap
 ## Requirements
 
 - **Hardware:** Infiray P2 Pro (or compatible USB thermal camera: PureThermal, "USB Camera" with same protocol).
-- **System:** macOS (AVFoundation). **ffmpeg** must be installed (e.g. `brew install ffmpeg`).
-- **Python:** 3.8+. Dependencies: `opencv-python`, `numpy`, `pystray`, `Pillow`, `pyvirtualcam` (optional, for virtual webcam).
+- **System:** macOS (AVFoundation). The standalone app includes **ffmpeg**. For running from source or building, install it first (e.g. `brew install ffmpeg`).
+- **Python:** 3.9+ recommended (3.10 in project venv). Dependencies: `opencv-python`, `numpy`, `pystray`, `Pillow`, `pyvirtualcam>=0.14` (for virtual webcam; 0.14+ needs Python 3.9+).
 
 ---
 
@@ -21,7 +21,16 @@ pip install -r requirements.txt
 python app.py
 ```
 
+For capture/temperature troubleshooting, run `venv/bin/python app.py --baseline --diagnostics`.
+This starts in Celsius with the ordinary Turbo palette, with SR, DYN, DDE,
+denoising and offset corrections disabled. It does not overwrite saved app
+settings. Diagnostics report the selected script/ffmpeg and sensor vs corrected
+temperature ranges plus the cursor temperature; a plausible numeric range alone
+does not establish measurement accuracy.
+
 Connect the P2 Pro; the app auto-detects it and opens the viewer. Use **I** in-app for the full control list.
+
+If the camera is plugged in but the viewer stays on **Reconnecting...**, macOS has not published it as a camera. Chrome/Brave WebUSB often holds the USB device so UVC never binds — close those browsers, or unplug the P2 Pro for ~5 s and plug it back in. The overlay names the process that has the device open.
 
 ---
 
@@ -36,11 +45,16 @@ Connect the P2 Pro; the app auto-detects it and opens the viewer. Use **I** in-a
 
 ### Image quality
 
-- **DDE – High Quality (H):** CLAHE + Lanczos upscale + unsharp mask. **[ / ]** = contrast, **-** **=** = sharpness.
-- **IBP upscale (Y):** Iterative Back-Projection — training-free refinement; **J** / **K** = strength 1–10.
-- **Burst SR (E):** Multi-frame super-resolution from subpixel shifts (Samsung-style): buffers frames, estimates shift via phase correlation, fuses to HR. Slight camera/scene motion improves result.
-- **FPN correction:** **C** = running per-pixel calibration; **X** = one-frame reference (capture now, subtract offset; **X** again = reset).
-- **De-noise (G):** NLM + temporal smoothing. **,** **.** = strength.
+- **Color + details (DYN / `{`):** enabled by default with Turbo on first use. Preserves the palette's temperature-coded hue while lifting dark colors and reserving highlight headroom. Local float-temperature detail modulates perceptual lightness at two spatial scales, with edge-aware filtering, a soft noise floor and bounded gain. Chroma is reduced where needed to fit the display gamut. **C− / C+** or **[ / ]** adjust gain 0–4 (default 2); **( / )** always adjust gain even with RGB enabled, where [ / ] remain zoom. Works with SR, other palettes, inversion, Delta-T, snapshots and frozen-frame comparison. Bypasses legacy DDE contrast/sharpening while enabled. Auto range endpoints are gently smoothed; image content is never temporally averaged by this mode. Temperature readings stay native; enhanced lightness is not an absolute temperature scale. DYN at gain 0 keeps palette illumination; turn DYN off for the ordinary palette/legacy DDE. `--dynamic-contrast` starts with DYN and Turbo explicitly.
+- **Float pipeline:** reconstruction uses original float °C samples before display denoising/clipping. Cursor, ROI, min/max and profiles use native temperature measurements; reconstructed pixels are display estimates. 8-bit mapping is only for display.
+- **DDE – High Quality (H):** contrast (gamma / percentile / CLAHE) + mild unsharp, applied *after* upsample. **[ / ]** = contrast, **-** **=** = sharpness.
+- **IBP upscale (Y):** Iterative Back-Projection on the float field; **J** / **K** = strength 1–10.
+- **Adaptive SR 2x (E / SR2x):** enabled by default; jointly reconstructs a 512×384 field from 8–16 original frames in one background worker, displayed at the usual 768×576 size. Only extra detail in stable, confidently aligned regions is added to the newest frame. Moving objects, thermal changes and their boundaries immediately use the current single frame. Camera jumps, capture gaps and calibration changes reset history; cancelled results cannot return. **E** compares on/off and is saved between launches. G/Y select the separate legacy denoise/IBP paths and turn adaptive SR off; E turns those paths off. Extra DDE sharpening and RGB edge guidance are bypassed while SR is active.
+- **SR status:** `SR collecting` / `SR working` while preparing; `SR need microshift` when the frames lack independent 2D subpixel positions; `SR 2x N%` reports the fraction of the displayed area accepting reconstructed detail. Gently move the camera in two directions while the subject stays still. A perfectly stationary camera only repeats the same sampling grid. `2x` describes the reconstruction grid, not a measured doubling of optical resolution.
+- **HQ snapshot (S):** saves the current view and a separate `_hq.png` if a validated reconstruction is ready. It never starts a blocking solver. Freeze with **Space**, wait briefly for an in-flight job if necessary, then **S**. Unsupported or moving regions retain the latest native-frame appearance.
+- **RGB-guided edges (O):** when the RGB camera is aligned, a guided filter snaps thermal edges to RGB edges without copying RGB texture (a poster on a wall does not become fake heat). Blend (full / hot-mask) is unchanged.
+- **FPN correction:** **C** = scene-based NUC. Learns column/row stripes and per-pixel offsets only while the camera pans (NCC-gated LMS; a static scene or a uniform wall is never burned in). **X** = flat-field: aim at a uniform surface, hold still ~2 s; a median of frames minus a fitted plane becomes the offset map (saved to disk, restored on launch). Moving during **X** is skipped (progress stalls). The target is also checked for uniformity: calibrating on a textured scene is refused (`FFC failed - aim at a uniform surface`) instead of baking a ghost of that scene into the map. A stored map that fails the same check is not loaded. **X** during calibration cancels, **X** while on = off.
+- **De-noise (G):** motion-compensated Kalman (static pixels average down NETD, moving pixels keep the new sample) + Edge-Gated Local Mean. **,** **.** = strength.
 
 ### Orientation (rotate & flip)
 
@@ -68,19 +82,27 @@ Useful when the camera is mounted upside-down or sideways; all overlays and meas
 ### Panels (Trend, Histogram, Line profile)
 
 - **Drag** by the title bar; **resize** by the bottom-right grip.
-- Layout is saved to `.p2pro_layout.json` and restored on next run.
+- Layout is saved to `~/Library/Application Support/Infiray P2 Pro/layout.json` and restored on next run.
 - White border indicates drag state.
 
 ### Other
 
 - **Rotate & flip** — **←/→** rotate 90°; **↑** flip V, **↓** flip H (see Orientation above).
 - **Freeze (Space)** — Pause stream; snapshot and other keys still work.
-- **Snapshot (S)** — Saves `snapshot_YYYYMMDD_HHMMSS.png` (current view with overlays).
+- **Snapshot (S)** — Saves `~/Pictures/Infiray P2 Pro/snapshot_YYYYMMDD_HHMMSS.png` (current view with overlays).
 - **Units (F)** — Toggle Celsius / Fahrenheit.
 - **Alarm (A)** — Red border + "HOT!" when max temp ≥ 60°C.
 - **Debug (D)** — Technical overlay (FPS, coords, temps, flags).
 - **Help (I)** — Full keyboard reference.
-- **Quit (Q)** — Exits; panel layout is saved.
+- **Quit (Q)** — Exits; panel layout and settings are saved.
+
+### Saved between runs
+
+Palette and invert, DYN on/off and gain, contrast mode and DDE parameters, DDE on/off, °C/°F, temperature-range
+preset, rotation and flips, de-noise and IBP strength, RGB blend mode / alpha / hot threshold /
+zoom, and the alarm threshold. Stored in
+`~/Library/Application Support/Infiray P2 Pro/settings.json`; the file can be hand-edited, which
+is currently the only way to change the alarm threshold (default 60 °C).
 - **System tray** — Menu bar icon with Quit (macOS).
 
 ### Virtual webcam (U) — for messengers / streaming
@@ -90,7 +112,7 @@ The **processed** thermal stream (after DDE, colormap, overlays) can be sent to 
 - **U** (or toolbar **VCAM**) — Toggle virtual cam output on/off.
 - **macOS:** Install [OBS](https://obsproject.com/), then **Start Virtual Camera** in OBS (no need to add a source). The app will stream 640×480 into it; in your messenger choose **OBS Virtual Camera** as the camera.
 - **Windows:** OBS Virtual Camera or compatible virtual cam; select it in the app.
-- Requires `pip install pyvirtualcam`. If the library or OBS virtual cam is unavailable, the toggle will report an error and stay off.
+- Requires `pyvirtualcam>=0.14` (installed in project venv). On macOS: OBS → Start Virtual Camera once, then close OBS; in the app press **U**. If the library or virtual cam is unavailable, the toggle will report an error and stay off.
 
 ---
 
@@ -99,10 +121,15 @@ The **processed** thermal stream (after DDE, colormap, overlays) can be sent to 
 | Item | Role |
 |------|------|
 | `app.py` | Main app: capture, pipeline, UI, panels, keyboard/mouse. |
-| `fpn_correction.py` | Fixed-pattern noise: per-pixel running mean, offset subtraction. |
+| `fpn_correction.py` | Fixed-pattern noise: separable column/row/pixel model; flat-field (median + plane) and gated IRLMS scene-based NUC. |
+| `denoise.py` | MC-Kalman temporal NR + edge-gated spatial mean. |
+| `guided_upsample.py` | RGB-guided filter that transfers edges, not texture. |
+| `burst_sr.py` | Float burst SR; HQ snapshot fusion + IBP + RL deconv. |
+| `adaptive_sr.py` | Active live SR: bounded background joint reconstruction, phase coverage, motion/temperature masks, immediate current-frame fallback. |
+| `test_adaptive_sr.py` | Detail recovery, sampling adjoint, subpixel registration, motion/occlusion and worker lifecycle regressions. |
 | `requirements.txt` | Python dependencies. |
 | `Infiray P2 Pro.spec` | PyInstaller spec for macOS .app bundle. |
-| `.p2pro_layout.json` | Saved panel positions/sizes (created at runtime). |
+| `~/Library/Application Support/Infiray P2 Pro/` | Saved panel layout and settings (created at runtime; outside the app bundle so they persist). |
 | `make-demo-gif.sh` | Script to build `demo.gif` from `demo.mov` (ffmpeg + gifsicle). |
 
 ---
@@ -112,10 +139,14 @@ The **processed** thermal stream (after DDE, colormap, overlays) can be sent to 
 To build a standalone macOS app:
 
 ```bash
-pyinstaller "Infiray P2 Pro.spec"
+venv/bin/pyinstaller --noconfirm "Infiray P2 Pro.spec"
 ```
 
-Output: `dist/Infiray P2 Pro.app`. Ensure ffmpeg is on the system PATH (or bundle it in the spec) for the packaged app to find the camera.
+Output: `dist/Infiray P2 Pro.app`. The build includes ffmpeg and its shared libraries, along with the Python runtime and application dependencies. The packaged app prefers its bundled ffmpeg and can be copied to `/Applications` and launched from Finder without Homebrew on PATH. OBS Virtual Camera remains a separate installation for the optional virtual webcam output.
+
+For development, `python app.py --sr --diagnostics` forces SR on and logs live FPS, accepted detail coverage and worker/foreground times every two seconds. Run imaging checks with `python -m unittest test_adaptive_sr test_imaging test_fpn_correction`.
+
+The reconstruction currently uses a conservative approximate effective Gaussian PSF with regularization, motion rejection and bounded detail amplitude. It has synthetic validation, not a measured P2 Pro optical-resolution/temperature-accuracy guarantee. The live view does not wait for SR; actual FPS and useful detail depend on the camera, scene and host.
 
 ---
 

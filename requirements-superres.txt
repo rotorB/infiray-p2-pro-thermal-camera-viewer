@@ -1,0 +1,3 @@
+# Optional: for neural upscale (Y key). Install after base requirements.
+# Run: pip uninstall opencv-python && pip install -r requirements-superres.txt
+opencv-contrib-python>=4.5.0

@@ -1,10 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import shutil
+
+ffmpeg_path = shutil.which('ffmpeg')
+if ffmpeg_path is None:
+    raise RuntimeError('Install ffmpeg before building the standalone app.')
 
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=[],
+    binaries=[(ffmpeg_path, '.')],
     datas=[],
     hiddenimports=['pystray', 'PIL', 'PIL.Image', 'PIL.ImageDraw'],
     hookspath=[],

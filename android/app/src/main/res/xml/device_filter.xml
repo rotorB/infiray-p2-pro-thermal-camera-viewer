@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Infiray P2 Pro in UVC mode: VID 0x0BDA, PID 0x5830 -->
+    <usb-device vendor-id="3034" product-id="22576" />
+</resources>

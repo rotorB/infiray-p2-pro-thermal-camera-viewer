@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Android 9+ requires CAMERA to open USB video-class devices. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Horizon OS gates UVC devices behind its own runtime permission as well. -->
+    <uses-permission android:name="horizonos.permission.USB_CAMERA" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+</manifest>

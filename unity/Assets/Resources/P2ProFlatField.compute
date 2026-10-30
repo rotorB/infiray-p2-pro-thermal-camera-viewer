@@ -1,0 +1,64 @@
+// Flat-field correction of the P2 Pro, learnt while painting the room (ThermalFlatField): the
+// sensor reads a few tenths of a degree differently towards its edges, which showed as seams
+// between frames on the painted room. Offsets on a coarse grid over the image are subtracted
+// where temperatures land on the room (P2ProFlatOffset.hlsl), never from the live image. The
+// room bake (P2ProThermalBake.compute) adds, per grid cell, how much the corrected sample still
+// differs from the room's running average where both are reliable; Update moves the offsets a
+// little towards that and keeps the image centre at 0, so absolute readings stay the camera's.
+// Surfaces only ever seen near the image edge give no signal (their average is made of the
+// same cells), so offsets would wander there: each frame they also decay a little towards 0,
+// and they stay within the sensor's real unevenness (a 7.5 C spread was seen without both).
+
+#define GRID_X 32
+#define GRID_Y 24
+#define CELLS (GRID_X * GRID_Y)
+#define FIXED 1000.0                    // residual sums in millidegrees
+#define MIN_SAMPLES 16
+#define MAX_OFFSET 1.0
+
+RWStructuredBuffer<float> _Offsets;     // °C to subtract, per cell, row 0 at the bottom
+RWStructuredBuffer<int> _FlatSum;
+RWStructuredBuffer<uint> _FlatCount;
+
+#pragma kernel Update
+
+float _Rate;
+float _Decay;
+#define CENTRE_CELLS (GRID_X / 2 * GRID_Y / 2)
+groupshared float _centre[CENTRE_CELLS];
+groupshared float _centreMean;
+
+[numthreads(GRID_X, GRID_Y, 1)]
+void Update(uint3 id : SV_GroupThreadID)
+{
+    uint i = id.y * GRID_X + id.x;
+    float o = _Offsets[i] * (1 - _Decay);
+    uint n = _FlatCount[i];
+    if (n >= MIN_SAMPLES) o = clamp(o + _Rate * _FlatSum[i] / FIXED / n, -MAX_OFFSET, MAX_OFFSET);
+    _FlatSum[i] = 0;
+    _FlatCount[i] = 0;
+
+    // Centre half of the image (each axis) averages to 0.
+    bool centre = id.x >= GRID_X / 4 && id.x < GRID_X * 3 / 4 && id.y >= GRID_Y / 4 && id.y < GRID_Y * 3 / 4;
+    if (centre) _centre[(id.y - GRID_Y / 4) * (GRID_X / 2) + id.x - GRID_X / 4] = o;
+    GroupMemoryBarrierWithGroupSync();
+    if (i == 0)
+    {
+        float sum = 0;
+        for (uint k = 0; k < CENTRE_CELLS; k++) sum += _centre[k];
+        _centreMean = sum / CENTRE_CELLS;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    _Offsets[i] = o - _centreMean;
+}
+
+#pragma kernel Reset
+
+[numthreads(GRID_X, GRID_Y, 1)]
+void Reset(uint3 id : SV_GroupThreadID)
+{
+    uint i = id.y * GRID_X + id.x;
+    _Offsets[i] = 0;
+    _FlatSum[i] = 0;
+    _FlatCount[i] = 0;
+}

@@ -1,5 +1,5 @@
 opencv-python==4.8.1.78
-numpy
+numpy<2  # opencv-python 4.8.x built for NumPy 1.x
 pystray
 Pillow
-pyvirtualcam
+pyvirtualcam>=0.14.0  # 0.14+ for OBS 30+ Virtual Camera on macOS 13+ (requires Python 3.9+)

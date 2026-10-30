@@ -1,0 +1,65 @@
+// Extra sharpness for the thermal image, as in the macOS viewer (app.py, high quality mode):
+// bilinear upsample, then an unsharp mask out = up + strength * (up - gauss(up)).
+// Works on °C, so the palette is still applied only at the end.
+#pragma kernel Upsample
+#pragma kernel BlurX
+#pragma kernel Sharpen
+
+Texture2D<float> _Source;               // °C, camera resolution
+RWTexture2D<float> _Up;                 // °C, upsampled
+RWTexture2D<float> _Tmp;                // horizontal blur of _Up
+RWTexture2D<float> _Result;
+Texture2D<float> _UpRead;
+Texture2D<float> _TmpRead;
+int2 _SourceSize;
+int2 _Size;
+float _Sigma;                           // in upsampled pixels
+int _Radius;
+float _Strength;
+
+float Weight(int k) { return exp(-k * k / (2 * _Sigma * _Sigma)); }
+
+// Bilinear by hand with pixel centres at +0.5 (cv2.INTER_LINEAR): linear filtering of
+// 32-bit float textures is optional on mobile GPUs.
+[numthreads(8, 8, 1)]
+void Upsample(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _Size)) return;
+    float2 p = ((float2)id.xy + 0.5) * (float2)_SourceSize / (float2)_Size - 0.5;
+    int2 i = (int2)floor(p);
+    float2 f = p - i;
+    int2 i0 = clamp(i, 0, _SourceSize - 1);
+    int2 i1 = clamp(i + 1, 0, _SourceSize - 1);
+    float bottom = lerp(_Source.Load(int3(i0.x, i0.y, 0)), _Source.Load(int3(i1.x, i0.y, 0)), f.x);
+    float top = lerp(_Source.Load(int3(i0.x, i1.y, 0)), _Source.Load(int3(i1.x, i1.y, 0)), f.x);
+    _Up[id.xy] = lerp(bottom, top, f.y);
+}
+
+[numthreads(8, 8, 1)]
+void BlurX(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _Size)) return;
+    float sum = 0, total = 0;
+    [loop] for (int k = -_Radius; k <= _Radius; k++)
+    {
+        float w = Weight(k);
+        sum += w * _UpRead.Load(int3(clamp((int)id.x + k, 0, _Size.x - 1), id.y, 0));
+        total += w;
+    }
+    _Tmp[id.xy] = sum / total;
+}
+
+[numthreads(8, 8, 1)]
+void Sharpen(uint3 id : SV_DispatchThreadID)
+{
+    if (any((int2)id.xy >= _Size)) return;
+    float sum = 0, total = 0;
+    [loop] for (int k = -_Radius; k <= _Radius; k++)
+    {
+        float w = Weight(k);
+        sum += w * _TmpRead.Load(int3(id.x, clamp((int)id.y + k, 0, _Size.y - 1), 0));
+        total += w;
+    }
+    float up = _UpRead.Load(int3(id.xy, 0));
+    _Result[id.xy] = up + _Strength * (up - sum / total);
+}
