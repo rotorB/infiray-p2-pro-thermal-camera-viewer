@@ -5,14 +5,16 @@ Problem: neighboring pixels on the same surface should share temperature, but
 sensor NETD noise makes them flicker. Real thermal edges (object boundaries)
 must stay sharp.
 
-Algorithm — Edge-Gated Local Mean (EGLM):
-  1. Temporal EMA — cancel random per-pixel flicker across frames.
-  2. Estimate noise σ from MAD of a high-pass residual (one number per frame).
-  3. Spatial stage: for each pixel, average only neighbors whose temperature
-     differs by less than ~k·σ (homogeneous region). Neighbors across a real
-     edge are excluded, so transitions are not smeared.
+Algorithm:
+  1. Motion-compensated Kalman — warp the previous estimate onto this frame
+     (NCC translation), then a per-pixel Kalman update. Static regions
+     collapse variance (~1/sqrt(N)); pixels that don't match the warp keep
+     the new measurement (no ghost trail).
+  2. Estimate noise σ from MAD of a high-pass residual.
+  3. Spatial Edge-Gated Local Mean: average only neighbors whose temperature
+     differs by less than ~k·σ, so real edges are not smeared.
 
-Applied on float temperature (°C) after conversion, before 8-bit normalization.
+Applied on float temperature (°C) after conversion, before 8-bit mapping.
 Single strength knob (1..10) controls both stages.
 """
 
@@ -20,6 +22,8 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+
+from fpn_correction import _downsample, _ncc_shift
 
 
 def estimate_noise_sigma(frame: np.ndarray) -> float:
@@ -92,13 +96,24 @@ def edge_gated_local_mean(
     return out.astype(np.float32)
 
 
+def _translate(img: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    """dst[y, x] = src[y+dy, x+dx] with subpixel linear sampling."""
+    h, w = img.shape[:2]
+    M = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+    return cv2.warpAffine(
+        img, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
 class ThermalDenoiser:
     """
-    Adjustable two-stage denoiser: temporal EMA + Edge-Gated Local Mean.
+    Adjustable two-stage denoiser: MC-Kalman + Edge-Gated Local Mean.
 
     strength (1..10):
       1   — almost pass-through (very light temporal only)
-      3   — default: mild temporal + light EGLM
+      3   — default: mild Kalman + light EGLM
       5   — moderate (good for the grainy P2 Pro look)
       10  — heavy smoothing (static / slow scenes)
     """
@@ -111,16 +126,20 @@ class ThermalDenoiser:
     def __init__(self, shape):
         self.shape = tuple(shape)
         self.strength = self.STRENGTH_DEFAULT
-        self._accum = None
+        self._x = None       # Kalman mean (HxW)
+        self._p = None       # Kalman variance (HxW)
+        self._prev = None    # last observation, for NCC
 
     def reset(self):
         """Discard temporal history."""
-        self._accum = None
+        self._x = None
+        self._p = None
+        self._prev = None
 
     @property
-    def _temporal_alpha(self) -> float:
-        """Weight of new frame in EMA. Lower = heavier averaging."""
-        return max(0.20, 1.0 - self.strength * 0.075)
+    def _q_scale(self) -> float:
+        """Process-noise scale vs measurement R. Lower = heavier averaging."""
+        return max(0.04, 1.55 - self.strength * 0.15)
 
     @property
     def _radius(self) -> int:
@@ -155,6 +174,45 @@ class ThermalDenoiser:
             1,
         )
 
+    def _kalman(self, z: np.ndarray) -> np.ndarray:
+        """Warp previous state onto this frame, then per-pixel Kalman update."""
+        sigma = estimate_noise_sigma(z)
+        R = max(sigma * sigma, 1e-6)
+
+        if self._x is None:
+            self._x = z.copy()
+            self._p = np.full(self.shape, R * 4.0, dtype=np.float32)
+            self._prev = z.copy()
+            return z
+
+        small_prev = _downsample(self._prev)
+        small_cur = _downsample(z)
+        dy, dx, peak, on_border = _ncc_shift(small_prev, small_cur, radius=8)
+        texture = float(small_cur.std())
+
+        if peak >= 0.40 and not on_border:
+            x_pred = _translate(self._x, dx, dy)
+            p_pred = _translate(self._p, dx, dy)
+        else:
+            x_pred = self._x
+            p_pred = self._p
+
+        innov = z - x_pred
+        # Extra process noise where the prediction missed (occlusion / new object).
+        # On a low-texture wall, peak is unreliable — keep Q small and average.
+        q_base = R * self._q_scale
+        if texture < 0.4 and peak < 0.40:
+            q_extra = 0.0
+        else:
+            q_extra = 0.25 * innov * innov
+        q = q_base + q_extra
+        p_pred = p_pred + q
+        k = p_pred / (p_pred + R)
+        self._x = x_pred + k * innov
+        self._p = (1.0 - k) * p_pred
+        self._prev = z.copy()
+        return self._x
+
     def apply(self, temp_celsius: np.ndarray) -> np.ndarray:
         """
         Denoise a single temperature frame (float, H×W).
@@ -167,14 +225,8 @@ class ThermalDenoiser:
         if frame.shape != self.shape:
             return frame
 
-        # --- Stage 1: temporal EMA ---
-        alpha = self._temporal_alpha
-        if self._accum is None:
-            self._accum = frame.copy()
-        else:
-            self._accum = alpha * frame + (1.0 - alpha) * self._accum
-
-        result = self._accum
+        # --- Stage 1: motion-compensated Kalman ---
+        result = self._kalman(frame)
 
         # --- Stage 2: Edge-Gated Local Mean ---
         iters = self._spatial_iters

@@ -1,0 +1,63 @@
+{
+  "model": "synthetic, known shifts and PSF; not camera validation",
+  "lr_shape": [
+    192,
+    256
+  ],
+  "hr_shape": [
+    384,
+    512
+  ],
+  "frames": 16,
+  "iterations": 25,
+  "effective_gaussian_psf_sigma_lr": 0.5,
+  "input_noise_sigma": 0.05,
+  "regularization_lambda": 0.1,
+  "regularization_sweep": {
+    "0.003": {
+      "rmse_synthetic_units": 0.18554691970348358,
+      "flat_error_std": 0.1140151396393776
+    },
+    "0.01": {
+      "rmse_synthetic_units": 0.20431610941886902,
+      "flat_error_std": 0.07046379894018173
+    },
+    "0.03": {
+      "rmse_synthetic_units": 0.24305638670921326,
+      "flat_error_std": 0.043042879551649094
+    },
+    "0.1": {
+      "rmse_synthetic_units": 0.28548136353492737,
+      "flat_error_std": 0.025332314893603325
+    }
+  },
+  "adjoint_relative_error": 8.198711990616224e-08,
+  "timing_seconds": {
+    "existing_live": 0.003903541248291731,
+    "existing_hq": 0.09128729114308953,
+    "inverse_known_shifts": 0.35124412504956126,
+    "inverse_wrong_shifts": 0.35293991724029183
+  },
+  "metrics": {
+    "single_bilinear": {
+      "rmse_synthetic_units": 0.3828890323638916,
+      "flat_error_std": 0.03800440952181816
+    },
+    "existing_live": {
+      "rmse_synthetic_units": 0.39388877153396606,
+      "flat_error_std": 0.008397867903113365
+    },
+    "existing_hq": {
+      "rmse_synthetic_units": 0.3636976480484009,
+      "flat_error_std": 0.0722011998295784
+    },
+    "inverse_known_shifts": {
+      "rmse_synthetic_units": 0.28548136353492737,
+      "flat_error_std": 0.025332314893603325
+    },
+    "inverse_shift_error_0.1px": {
+      "rmse_synthetic_units": 0.29042333364486694,
+      "flat_error_std": 0.025465212762355804
+    }
+  }
+}

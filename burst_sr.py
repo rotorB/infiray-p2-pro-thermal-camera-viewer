@@ -1,49 +1,66 @@
 """
-Multi-frame super-resolution from subpixel shifts (Samsung-style burst SR).
+Multi-frame super-resolution from subpixel shifts, in temperature space.
 
-Uses micro-movements between frames (camera shake or scene motion) to capture
-the same scene at slightly different subpixel positions, then fuses frames
-onto a higher-resolution grid. No learning; resolution comes from temporal
-integration. Works with any image source including thermal.
+Live path: shift-and-add of the last N float °C frames.
+HQ path (snapshot): sigma-clipped fusion + IBP + mild Richardson–Lucy.
 
-Pipeline:
-  1. Buffer last N LR frames (e.g. 9).
-  2. Estimate subpixel shift of each frame vs reference (phase correlation).
-  3. Fuse: for each HR pixel, sample each frame at corresponding LR position
-     (accounting for shift), average. Result has more samples than sensor.
+Shifts are estimated on a blurred copy so residual FPN does not pin the
+peak at zero (phase correlation's whitening would otherwise lock onto the
+fixed pattern). Huge hops are rejected and the burst is re-anchored.
 """
+
+from __future__ import annotations
+
+from collections import deque
 
 import cv2
 import numpy as np
-from collections import deque
+
+def _gaussian_kernel(sigma: float, radius: int | None = None) -> np.ndarray:
+    if radius is None:
+        radius = max(1, int(np.ceil(3.0 * sigma)))
+    ax = np.arange(-radius, radius + 1, dtype=np.float32)
+    xx, yy = np.meshgrid(ax, ax)
+    k = np.exp(-(xx * xx + yy * yy) / (2.0 * sigma * sigma))
+    k /= k.sum()
+    return k.astype(np.float32)
+
+
+def richardson_lucy(img: np.ndarray, psf_sigma: float = 0.7, n_iter: int = 6) -> np.ndarray:
+    """Mild RL deconvolution. Shifts the field to stay strictly positive."""
+    img = np.ascontiguousarray(img, dtype=np.float32)
+    offset = float(img.min()) - 1.0
+    x = img - offset
+    observed = x.copy()
+    psf = _gaussian_kernel(psf_sigma)
+    psf_flip = psf[::-1, ::-1].copy()
+    for _ in range(max(0, int(n_iter))):
+        conv = cv2.filter2D(x, -1, psf, borderType=cv2.BORDER_REFLECT)
+        conv = np.maximum(conv, 1e-6)
+        relative = observed / conv
+        x = x * cv2.filter2D(relative, -1, psf_flip, borderType=cv2.BORDER_REFLECT)
+        x = np.maximum(x, 1e-6)
+    return x + offset
 
 
 class BurstSR:
     """
-    Accumulates LR frames, estimates subpixel shifts via phase correlation,
-    fuses onto HR grid (scale x LR size).
+    Accumulates LR float frames, estimates subpixel shifts, fuses onto an
+    HR grid (scale × LR size).
     """
 
-    def __init__(self, lr_shape, scale=3, max_frames=9):
-        """
-        Args:
-            lr_shape: (H, W) of low-res input, e.g. (192, 256).
-            scale: Output scale factor (e.g. 3 -> 576x768).
-            max_frames: Max frames in buffer (4–16 typical).
-        """
-        self.lr_shape = lr_shape
-        self.scale = scale
-        self.hr_shape = (lr_shape[0] * scale, lr_shape[1] * scale)
-        self.max_frames = max(2, min(max_frames, 25))
-        self._buffer = deque(maxlen=self.max_frames)  # list of (frame_float32, dx, dy)
-        self._ref = None  # reference frame for alignment
-        self._rejects = 0  # consecutive frames whose shift was out of range
-
-    # A fixed reference drifts out of range as the scene moves; once every shift
-    # is rejected the fusion silently degrades into plain frame averaging, i.e.
-    # motion blur. Re-anchor instead.
-    MAX_SHIFT_PX = 5.0
+    MAX_SHIFT_PX = 8.0
     REANCHOR_AFTER = 3
+    MIN_RESPONSE = 0.08
+
+    def __init__(self, lr_shape, scale=3, max_frames=16):
+        self.lr_shape = tuple(lr_shape)
+        self.scale = int(scale)
+        self.hr_shape = (self.lr_shape[0] * self.scale, self.lr_shape[1] * self.scale)
+        self.max_frames = max(2, min(int(max_frames), 25))
+        self._buffer = deque(maxlen=self.max_frames)
+        self._ref = None
+        self._rejects = 0
 
     def reset(self):
         self._buffer.clear()
@@ -51,25 +68,26 @@ class BurstSR:
         self._rejects = 0
 
     def _estimate_shift(self, ref, curr):
-        """Subpixel shift of curr relative to ref, or None if it is unusable."""
-        if ref.shape != curr.shape or ref.dtype != curr.dtype:
+        """Subpixel shift of curr relative to ref, or None if unusable."""
+        if ref.shape != curr.shape:
             return None
+        a = cv2.GaussianBlur(np.ascontiguousarray(ref, dtype=np.float32), (0, 0), 1.4)
+        b = cv2.GaussianBlur(np.ascontiguousarray(curr, dtype=np.float32), (0, 0), 1.4)
         try:
-            # Phase correlation: shift of curr w.r.t. ref
-            (dx, dy), _ = cv2.phaseCorrelate(
-                np.asarray(ref, dtype=np.float32),
-                np.asarray(curr, dtype=np.float32),
-            )
+            (dx, dy), resp = cv2.phaseCorrelate(a, b)
         except cv2.error:
             return None
-        # Reject huge shifts (scene change or failure)
+        if not np.isfinite(dx) or not np.isfinite(dy) or not np.isfinite(resp):
+            return None
+        if resp < self.MIN_RESPONSE:
+            return None
         if abs(dx) > self.MAX_SHIFT_PX or abs(dy) > self.MAX_SHIFT_PX:
             return None
         return float(dx), float(dy)
 
     def push(self, lr_frame: np.ndarray) -> None:
-        """Add one LR frame (H, W) uint8 or float. Updates buffer and shifts."""
-        lr = np.asarray(lr_frame, dtype=np.float32)
+        """Add one LR frame (H, W) float °C."""
+        lr = np.ascontiguousarray(lr_frame, dtype=np.float32)
         if lr.shape[:2] != self.lr_shape:
             return
         if self._ref is None:
@@ -82,8 +100,6 @@ class BurstSR:
         if shift is None:
             self._rejects += 1
             if self._rejects >= self.REANCHOR_AFTER:
-                # The scene has moved away from the reference: start a new burst
-                # rather than fusing frames we cannot align.
                 self._buffer.clear()
                 self._ref = lr.copy()
                 self._rejects = 0
@@ -94,41 +110,62 @@ class BurstSR:
         dx, dy = shift
         self._buffer.append((lr.copy(), dx, dy))
 
+    def _remap(self, frame, dx, dy):
+        h_hr, w_hr = self.hr_shape
+        xx = np.arange(w_hr, dtype=np.float32) / self.scale + dx
+        yy = np.arange(h_hr, dtype=np.float32) / self.scale + dy
+        map_x = np.broadcast_to(xx, (h_hr, w_hr)).copy()
+        map_y = np.broadcast_to(yy[:, np.newaxis], (h_hr, w_hr)).copy()
+        return cv2.remap(
+            frame, map_x, map_y,
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT101,
+        )
+
+    def _fuse_mean(self):
+        acc = np.zeros(self.hr_shape, dtype=np.float32)
+        n = 0
+        for frame, dx, dy in self._buffer:
+            acc += self._remap(frame, dx, dy)
+            n += 1
+        return acc / max(n, 1)
+
     def get_hr(self):
-        """
-        Fuse buffered frames onto HR grid using subpixel positions.
-        Returns (H*scale, W*scale) uint8, or None if too few frames.
-        """
+        """Live fusion: mean of aligned frames. Float °C HR, or None if <2 frames."""
         if len(self._buffer) < 2:
             return None
-        h_lr, w_lr = self.lr_shape
-        h_hr, w_hr = self.hr_shape
-        acc = np.zeros(self.hr_shape, dtype=np.float32)
-        wgt = np.zeros(self.hr_shape, dtype=np.float32) + 1e-6
+        return self._fuse_mean()
 
-        # Build sampling grid for HR: for each HR (i,j), LR coords are (j/scale, i/scale)
-        # For frame with shift (dx, dy), we sample LR at (j/scale + dx, i/scale + dy)
-        for frame, dx, dy in self._buffer:
-            # For each HR pixel (i,j), sample LR at (x,y) = (j/scale + dx, i/scale + dy)
-            # cv2.remap needs map_x, map_y shape (h_hr, w_hr)
-            xx = (np.arange(w_hr, dtype=np.float32) / self.scale + dx)
-            yy = (np.arange(h_hr, dtype=np.float32) / self.scale + dy)
-            map_x = np.broadcast_to(xx, (h_hr, w_hr)).copy()
-            map_y = np.broadcast_to(yy[:, np.newaxis], (h_hr, w_hr)).copy()
-            sampled = cv2.remap(
-                frame,
-                map_x,
-                map_y,
-                cv2.INTER_LINEAR,
-                borderMode=cv2.BORDER_REFLECT101,
-            )
-            acc += sampled
-            # Weight by validity (optional: downweight near borders)
-            wgt += 1.0
-
-        out = (acc / wgt).astype(np.float32)
-        out = np.clip(out, 0, 255)
-        return out.astype(np.uint8)
+    def get_hq(self):
+        """
+        Snapshot-quality fusion: sigma-clipped mean, IBP against the reference
+        LR frame, mild RL deconv. None if the buffer is too thin.
+        """
+        if len(self._buffer) < 4:
+            return self.get_hr()
+        stack = np.stack(
+            [self._remap(frame, dx, dy) for frame, dx, dy in self._buffer],
+            axis=0,
+        )
+        med = np.median(stack, axis=0)
+        mad = np.median(np.abs(stack - med), axis=0) + 1e-3
+        cap = 2.5 * 1.4826 * mad
+        fused = np.mean(np.clip(stack, med - cap, med + cap), axis=0)
+        ref = self._ref if self._ref is not None else self._buffer[-1][0]
+        # IBP so the fused HR still downscales to the (sharpest) reference.
+        h, w = ref.shape[:2]
+        hr_wh = (w * self.scale, h * self.scale)
+        lo = float(ref.min())
+        hi = float(ref.max())
+        span = max(hi - lo, 1e-3)
+        hr = fused
+        for _ in range(6):
+            recon = cv2.resize(hr, (w, h), interpolation=cv2.INTER_AREA)
+            err = ref - recon
+            err_hr = cv2.resize(err, hr_wh, interpolation=cv2.INTER_CUBIC)
+            hr = hr + 0.45 * err_hr
+            np.clip(hr, lo - 0.25 * span, hi + 0.25 * span, out=hr)
+        return richardson_lucy(hr, psf_sigma=0.65, n_iter=5)
 
     @property
     def frame_count(self):

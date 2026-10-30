@@ -15,19 +15,30 @@ from datetime import datetime
 import pystray
 from PIL import Image, ImageDraw
 
-from fpn_correction import FPNCorrector
+from fpn_correction import FPNCorrector, FlatFieldCalibrator
 from denoise import ThermalDenoiser
-from ibp_upscale import ibp_upscale
-from burst_sr import BurstSR
+from ibp_upscale import ibp_upscale_float
+from adaptive_sr import AdaptiveSR
+from dynamic_contrast import DynamicContrast
+from guided_upsample import upsample_float, refine_with_rgb_guide
 from rgb_camera import find_rgb_camera_index, RGBCamera, GradientAligner
+from usb_p2pro import format_unavailable_hint, probe_p2pro_usb
 
-# macOS .app bundles do not inherit the shell PATH. Add common Homebrew paths:
-os.environ['PATH'] += os.pathsep + '/opt/homebrew/bin' + os.pathsep + '/usr/local/bin'
+# Prefer bundled ffmpeg for both thermal and RGB camera discovery. Finder does
+# not inherit the shell PATH; Homebrew paths remain useful when running source.
+_ffmpeg_dirs = []
+if getattr(sys, 'frozen', False):
+    _ffmpeg_dirs.append(sys._MEIPASS)
+_ffmpeg_dirs.extend([os.environ.get('PATH', ''), '/opt/homebrew/bin', '/usr/local/bin'])
+os.environ['PATH'] = os.pathsep.join(_ffmpeg_dirs)
 FFMPEG_PATH = shutil.which('ffmpeg') or 'ffmpeg'
 
 # `ffmpeg -list_devices` can hang (permission prompt, device in a bad state).
 # Every call is bounded so the GUI thread can never be stuck on it.
 DEVICE_SCAN_TIMEOUT_S = 5.0
+# After an unplug/replug the UVC stack often needs several seconds before the
+# first frame. Treating that wait as a stall kills ffmpeg in a loop.
+FIRST_FRAME_TIMEOUT_S = 8.0
 
 APP_NAME = 'Infiray P2 Pro'
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,9 +78,10 @@ def _snapshot_dir():
     return _user_data_dir()
 
 
-def save_snapshot(img):
+def save_snapshot(img, suffix=''):
     """Write a snapshot PNG. Returns the path, or None if the write failed."""
-    path = os.path.join(_snapshot_dir(), f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    tag = datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = os.path.join(_snapshot_dir(), f"snapshot_{tag}{suffix}.png")
     try:
         ok = cv2.imwrite(path, img)
     except cv2.error:
@@ -160,6 +172,9 @@ KEY_RGB_ALPHA_DOWN = {ord('~')}           # decrease full-blend alpha -0.05
 KEY_RGB_ZOOM_IN  = {ord(']')}             # zoom in (when RGB on; else ] = DDE contrast)
 KEY_RGB_ZOOM_OUT = {ord('[')}             # zoom out (when RGB on)
 KEY_CONTRAST_MODE = {ord('}')}             # cycle contrast: off -> gamma -> percentile
+KEY_DYNAMIC_CONTRAST = {ord('{')}          # color + local lightness detail
+KEY_DYNAMIC_DOWN = {ord('(')}
+KEY_DYNAMIC_UP = {ord(')')}
 # Arrow keys: macOS 63232-63235, GTK 65361-65364, some backends 0-3.
 # Codes 81-84 are deliberately NOT listed: they are ord('Q'/'R'/'S'/'T'),
 # already claimed by quit/ROI/snapshot/isotherm above, so they never reach here.
@@ -177,21 +192,21 @@ _TB_PAD = 2
 _TOOLBAR_DEFS = [
     # Row 0: Display & Measurement
     ('palette', 'PAL'),  ('invert',  'INV'),  ('range',   'RNG'),  ('minmax',  'M/M'),
-    ('freeze',  'FRZ'),  ('snap',    'SNAP'), ('fahr',    'F/C'),
+    ('dynamic', 'DYN'),  ('freeze',  'FRZ'),  ('snap',    'SNAP'), ('fahr',    'F/C'),
     ('roi',     'ROI'),  ('line',    'LINE'), ('iso',     'ISO'),
     ('hist',    'HIST'), ('trend',   'TRND'), ('anomaly', 'ANOM'),
     ('delta',   'dT'),   ('alarm',   'ALM'),
     # Row 1: Enhancement & Control
     ('dde',     'DDE'),  ('cont_dn', 'C-'),   ('cont_up', 'C+'),
     ('shrp_dn', 'S-'),   ('shrp_up', 'S+'),   ('fpn',     'FPN'),
-    ('fpn1',    '1FPN'), ('dnz',     'DNZ'),  ('dnz_dn',  'D-'),   ('dnz_up',  'D+'),
-    ('ibp',     'IBP'),  ('ibp_dn',  'I-'),   ('ibp_up',  'I+'),   ('burst',   'BRST'),
+    ('fpn1',    'FFC'),  ('dnz',     'DNZ'),  ('dnz_dn',  'D-'),   ('dnz_up',  'D+'),
+    ('ibp',     'IBP'),  ('ibp_dn',  'I-'),   ('ibp_up',  'I+'),   ('burst',   'SR2x'),
     ('rot_l',   'RoL'),  ('rot_r',   'RoR'),
     ('flip_v',  'FlV'),  ('flip_h',  'FlH'),  ('vcam',    'VCAM'),
     ('rgb',     'RGB'),  ('rgb_cal', 'CAL'),  ('rgb_bld', 'BLD'),
     ('debug',   'DBG'),  ('help',    'HLP'),  ('quit',    'QUIT'),
 ]
-_TB_ROW0 = 15
+_TB_ROW0 = 16
 
 _TOOLBAR_KEY_MAP = {
     'palette': ord('p'), 'invert': ord('z'), 'range': ord('0'), 'minmax': ord('m'),
@@ -200,6 +215,7 @@ _TOOLBAR_KEY_MAP = {
     'hist': ord('b'), 'trend': ord('w'), 'anomaly': ord('n'),
     'delta': ord('v'), 'alarm': ord('a'),
     'dde': ord('h'), 'cont_dn': ord('['), 'cont_up': ord(']'),
+    'dynamic': ord('{'),
     'shrp_dn': ord('-'), 'shrp_up': ord('='), 'fpn': ord('c'),
     'fpn1': ord('x'), 'dnz': ord('g'), 'dnz_dn': ord(','), 'dnz_up': ord('.'),
     'ibp': ord('y'), 'ibp_dn': ord('j'), 'ibp_up': ord('k'), 'burst': ord('e'), 'rot_l': 63234, 'rot_r': 63235,
@@ -211,7 +227,7 @@ _TOOLBAR_KEY_MAP = {
 _TOOLBAR_TOGGLES = {
     'minmax', 'freeze', 'fahr', 'invert', 'roi', 'line', 'iso', 'hist',
     'trend', 'anomaly', 'delta', 'alarm', 'dde', 'fpn', 'fpn1', 'dnz', 'ibp', 'burst',
-    'flip_v', 'flip_h', 'vcam', 'rgb', 'debug', 'help',
+    'flip_v', 'flip_h', 'vcam', 'rgb', 'debug', 'help', 'dynamic',
 }
 
 
@@ -230,6 +246,19 @@ def _toolbar_find_button(x, y_rel, dw):
     return None
 
 
+def ffc_status_text(flatfield, enabled):
+    """Status-bar label for flat-field calibration: progress, 'FFC', or None."""
+    if flatfield.calibrating:
+        done, total = flatfield.progress
+        return f"FFC {done}/{total}"
+    if flatfield.reject_reason:
+        # The calibration ran to the end and was refused. Without this the
+        # indicator would just vanish and the user would never learn why the
+        # map they were waiting for was not written.
+        return f"FFC failed - {flatfield.reject_reason}"
+    return 'FFC' if enabled else None
+
+
 def draw_status_bar(img, y0, dw, state):
     """Draw status bar on *img* at rows [y0, y0+STATUS_BAR_H): dark background, left=modes/params, right=FPS."""
     img[y0:y0 + STATUS_BAR_H, 0:dw] = (28, 28, 28)
@@ -243,18 +272,25 @@ def draw_status_bar(img, y0, dw, state):
         state.get('palette_name', 'Jet'),
         'HQ' if state.get('high_quality_mode') else '—',
         f"Cont:{state.get('dde_clip_limit', 0):.1f}({cont_label})",
-        f"Shrp:{state.get('dde_sharp_strength', 0):.1f}",
+        'Shrp:off' if state.get('burst_sr_enabled') else f"Shrp:{state.get('dde_sharp_strength', 0):.1f}",
     ]
-    if state.get('single_frame_fpn_enabled'):
-        parts.append('1FPN')
+    if state.get('dynamic_contrast_enabled'):
+        parts = [state.get('palette_name', 'Turbo'),
+                 f"DYN:{state.get('dynamic_gain', 2.0):.1f}", 'Color + details']
+    if state.get('burst_sr_enabled'):
+        parts.insert(2 if state.get('dynamic_contrast_enabled') else 1,
+                     state.get('sr_status', 'SR collecting'))
+    ffc_text = state.get('ffc_text')
+    if ffc_text:
+        parts.append(ffc_text)
     if state.get('fpn_enabled'):
         parts.append('FPN')
     if state.get('denoise_enabled'):
         parts.append(f"DNZ{state.get('denoiser_strength', 0):.1f}")
     if state.get('ibp_upscale_enabled'):
         parts.append(f"IBP{state.get('ibp_strength', 0)}")
-    if state.get('burst_sr_enabled'):
-        parts.append(f"Burst{state.get('burst_frame_count', 0)}")
+    if state.get('rgb_guided'):
+        parts.append('GUIDE')
     if state.get('delta_t_enabled'):
         parts.append('dT')
     if state.get('isotherm_enabled'):
@@ -321,7 +357,7 @@ def get_camera_index(timeout=DEVICE_SCAN_TIMEOUT_S):
     Never blocks longer than *timeout*: a hung `ffmpeg -list_devices` (camera
     permission prompt, device in a bad state) must not freeze the caller.
     """
-    cmd = [FFMPEG_PATH, '-f', 'avfoundation', '-list_devices', 'true', '-i', '""']
+    cmd = [FFMPEG_PATH, '-f', 'avfoundation', '-list_devices', 'true', '-i', 'none']
     try:
         result = subprocess.run(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -330,17 +366,22 @@ def get_camera_index(timeout=DEVICE_SCAN_TIMEOUT_S):
     except (subprocess.TimeoutExpired, OSError):
         return None
 
-    lines = result.stderr.split('\n')
-    for line in lines:
+    thermal_name = re.compile(
+        r'USB Camera|PureThermal|P2 Pro|InfiRay|Infiray', re.IGNORECASE
+    )
+    listed = []
+    for line in result.stderr.split('\n'):
         if 'AVFoundation video devices:' in line:
             continue
         if 'AVFoundation audio devices:' in line:
             break
-        
-        match = re.search(r'\[(\d+)\]\s+(USB Camera|PureThermal|P2 Pro)', line, re.IGNORECASE)
-        if match:
-            return match.group(1)
-            
+        m = re.search(r'\[(\d+)\]\s+(.+)', line)
+        if not m:
+            continue
+        idx, name = m.group(1), m.group(2).strip()
+        listed.append(f"{idx}:{name}")
+        if thermal_name.search(name):
+            return idx
     return None
 
 def format_temp(celsius, use_fahrenheit):
@@ -354,6 +395,15 @@ def unsharp_mask(img_uint8, sigma=1.0, strength=1.5):
     blurred = cv2.GaussianBlur(img_uint8, (0, 0), sigma)
     sharp = cv2.addWeighted(img_uint8, 1.0 + strength, blurred, -strength, 0)
     return np.clip(sharp, 0, 255).astype(np.uint8)
+
+
+def temp_to_uint8(temp, tmin, tmax):
+    """Map a float temperature field to uint8 using [tmin, tmax] → [0, 255]."""
+    temp = np.asarray(temp, dtype=np.float32)
+    span = float(tmax) - float(tmin)
+    if span <= 1e-6:
+        return np.zeros(temp.shape[:2], dtype=np.uint8)
+    return np.clip((temp - float(tmin)) * (np.float32(255.0) / span), 0, 255).astype(np.uint8)
 
 
 def compute_fps(fps_times):
@@ -386,6 +436,7 @@ def _read_exact(stream, size):
 
 PANELS_FILE = os.path.join(_user_data_dir(), 'layout.json')
 SETTINGS_FILE = os.path.join(_user_data_dir(), 'settings.json')
+FLATFIELD_FILE = os.path.join(_user_data_dir(), 'flatfield.npy')
 # Files written by older versions, next to the script; read once if no new file exists.
 _LEGACY_PANELS_FILE = os.path.join(_SCRIPT_DIR, '.p2pro_layout.json')
 _LEGACY_SETTINGS_FILE = os.path.join(_SCRIPT_DIR, '.p2pro_settings.json')
@@ -546,6 +597,8 @@ _SETTINGS_SCHEMA = {
     'palette_idx':        lambda v, n: _clamp_num(v, 0, n - 1, int),
     'palette_invert':     lambda v, n: bool(v),
     'contrast_mode':      lambda v, n: _one_of(v, ('off', 'gamma', 'percentile', 'clahe')),
+    'dynamic_contrast_enabled': lambda v, n: bool(v),
+    'dynamic_gain':       lambda v, n: _clamp_num(v, 0.0, 4.0),
     'dde_clip_limit':     lambda v, n: _clamp_num(v, 0.0, 10.0),
     'dde_sharp_strength': lambda v, n: _clamp_num(v, 0.0, 10.0),
     'dde_sharp_sigma':    lambda v, n: _clamp_num(v, 0.2, 5.0),
@@ -556,7 +609,9 @@ _SETTINGS_SCHEMA = {
     'flip_h':             lambda v, n: bool(v),
     'flip_v':             lambda v, n: bool(v),
     'denoise_strength':   lambda v, n: _clamp_num(v, 1.0, 10.0),
+    'flatfield_enabled':  lambda v, n: bool(v),
     'ibp_strength':       lambda v, n: _clamp_num(v, 1, 10, int),
+    'burst_sr_enabled':   lambda v, n: bool(v),
     'alarm_threshold':    lambda v, n: _clamp_num(v, -20.0, 150.0),
     'rgb_blend_mode':     lambda v, n: _one_of(v, ('full', 'hot_mask')),
     'rgb_alpha':          lambda v, n: _clamp_num(v, 0.0, 1.0),
@@ -793,8 +848,17 @@ def draw_anomaly_overlay(colormap, temp_celsius, sensitivity, scale, use_fahrenh
 
 FRAME_W, FRAME_H = 256, 384
 FRAME_SIZE = FRAME_W * FRAME_H * 2  # YUYV: 2 bytes/pixel
-RECONNECT_INTERVAL_S = 1.0
-STALL_TIMEOUT_S = 2.0
+
+
+def decode_thermal_frame(raw_bytes):
+    """Decode the payload as little-endian sensor words, never as YUV colors."""
+    if len(raw_bytes) != FRAME_SIZE:
+        raise ValueError(f'Expected {FRAME_SIZE} capture bytes, got {len(raw_bytes)}')
+    return np.frombuffer(raw_bytes, dtype='<u2', offset=FRAME_SIZE // 2).reshape(192, 256).copy()
+
+
+RECONNECT_INTERVAL_S = 0.8
+STALL_TIMEOUT_S = 2.5
 # While frozen there is no new data; poll at UI rate instead of spinning.
 FROZEN_POLL_MS = 30
 
@@ -849,8 +913,31 @@ class FrameReader(threading.Thread):
         return time.monotonic() - t
 
 
+def capture_health(reader, capture_started_at, now=None,
+                   stall_s=STALL_TIMEOUT_S, first_frame_s=FIRST_FRAME_TIMEOUT_S):
+    """Why the capture is dead, or None if it looks alive (or still starting).
+
+    A stream that has never delivered a frame is *not* stalled until
+    *first_frame_s*: after an unplug the P2 Pro often needs several seconds
+    before UVC starts. A stream that *was* flowing uses the shorter stall_s.
+    """
+    now = time.monotonic() if now is None else now
+    if reader is None or not reader.running:
+        return "disconnected"
+    age = reader.seconds_since_frame()
+    if age is not None:
+        if age > stall_s:
+            return "stalled (no frames)"
+        return None
+    if capture_started_at > 0 and (now - capture_started_at) > first_frame_s:
+        return "opened but no frames"
+    return None
+
+
 def _ffmpeg_capture_command(cam_index):
-    # -fflags nobuffer / -flags low_delay: minimize latency
+    # -pixel_format is the avfoundation *input* option; -pix_fmt before -i is
+    # ignored. `:none` skips audio (opening the default mic can fail the whole
+    # capture after a USB reset).
     return [
         FFMPEG_PATH,
         '-hide_banner',
@@ -860,16 +947,30 @@ def _ffmpeg_capture_command(cam_index):
         '-f', 'avfoundation',
         '-framerate', '25',
         '-video_size', f'{FRAME_W}x{FRAME_H}',
-        '-pix_fmt', 'yuyv422',
-        '-i', str(cam_index),
+        '-pixel_format', 'yuyv422',
+        '-i', f'{cam_index}:none',
         '-f', 'rawvideo',
         '-pix_fmt', 'yuyv422',
         '-',
     ]
 
 
-def start_thermal_capture(cam_index=None):
-    """Open P2 Pro via ffmpeg. Returns (process, reader, cam_index) or (None, None, None)."""
+def _drain_stderr(stream):
+    try:
+        if stream is not None:
+            stream.read()
+    except Exception:
+        pass
+
+
+def start_thermal_capture(cam_index=None, wait_for_frame=False):
+    """Open P2 Pro via ffmpeg. Returns (process, reader, cam_index) or (None, None, None).
+
+    If *wait_for_frame* is true, do not return a live process until one full
+    frame has arrived (or FIRST_FRAME_TIMEOUT_S / ffmpeg death). Returning a
+    process that then gets killed 2 s later as "stalled" is what broke
+    short-unplug reconnect: the camera was still waking up.
+    """
     if cam_index is None:
         cam_index = get_camera_index()
     if cam_index is None:
@@ -877,51 +978,62 @@ def start_thermal_capture(cam_index=None):
     process = subprocess.Popen(
         _ffmpeg_capture_command(cam_index),
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         bufsize=0,  # raw, unbuffered: keeps select() in FrameReader.run() truthful
     )
+    threading.Thread(target=_drain_stderr, args=(process.stderr,), daemon=True).start()
     reader = FrameReader(process, FRAME_SIZE)
     reader.start()
-    return process, reader, cam_index
+    if not wait_for_frame:
+        if process.poll() is not None:
+            print(f"ffmpeg exited immediately (index {cam_index})")
+            stop_thermal_capture(process, reader)
+            return None, None, None
+        return process, reader, cam_index
+
+    deadline = time.monotonic() + FIRST_FRAME_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            print(f"ffmpeg exited before the first frame (index {cam_index})")
+            stop_thermal_capture(process, reader)
+            return None, None, None
+        if reader.get_latest_frame() is not None:
+            return process, reader, cam_index
+        time.sleep(0.04)
+    print(f"No frame within {FIRST_FRAME_TIMEOUT_S:.0f}s (index {cam_index}) — retrying")
+    stop_thermal_capture(process, reader)
+    return None, None, None
 
 
 def stop_thermal_capture(process, reader):
-    """Stop FrameReader and terminate ffmpeg (best-effort).
+    """Stop FrameReader and kill ffmpeg (best-effort).
 
-    Order matters: killing ffmpeg gives the reader EOF, so it leaves read().
-    Only once the reader thread is gone may stdout be closed -- closing a
-    stream another thread is reading from is a data race in the io layer.
+    SIGTERM is ignored by a hung AVFoundation read after unplug; SIGKILL
+    first. Then close stdout so a reader stuck in read() unblocks.
     """
     if reader is not None:
         reader.running = False
     if process is not None:
         try:
             if process.poll() is None:
-                process.terminate()
+                process.kill()
                 try:
-                    process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
                     process.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
         except Exception:
             try:
                 process.kill()
             except Exception:
                 pass
-
-    reader_gone = True
-    if reader is not None:
-        reader.join(timeout=2.0)
-        reader_gone = not reader.is_alive()
-
-    # Leave the pipe open if the reader is somehow still inside read();
-    # the thread is a daemon and the fd is reclaimed when the process exits.
-    if process is not None and reader_gone:
         try:
             if process.stdout:
                 process.stdout.close()
         except Exception:
             pass
+
+    if reader is not None:
+        reader.join(timeout=1.5)
 
 
 class CaptureOpener(threading.Thread):
@@ -935,11 +1047,18 @@ class CaptureOpener(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.result = (None, None, None)
+        self.hint = None
         self.done = threading.Event()
 
     def run(self):
         try:
-            self.result = start_thermal_capture()
+            self.result = start_thermal_capture(wait_for_frame=True)
+            if self.result[0] is None:
+                info = probe_p2pro_usb()
+                self.hint = format_unavailable_hint(info)
+                print("P2 Pro not available:", self.hint)
+                if info.get('present') and info.get('holders'):
+                    print("  USB is held by:", ", ".join(info['holders']))
         except Exception as e:
             print("Capture open failed:", e)
             self.result = (None, None, None)
@@ -948,15 +1067,23 @@ class CaptureOpener(threading.Thread):
 
     def abandon(self):
         """Called when quitting mid-attempt: tear down whatever we opened."""
-        if self.done.wait(timeout=DEVICE_SCAN_TIMEOUT_S + 2.0):
+        if self.done.wait(timeout=DEVICE_SCAN_TIMEOUT_S + FIRST_FRAME_TIMEOUT_S + 2.0):
             proc, rdr, _ = self.result
             if proc is not None or rdr is not None:
                 stop_thermal_capture(proc, rdr)
 
 
 def main():
+    diagnostics = '--diagnostics' in sys.argv
+    baseline = '--baseline' in sys.argv
+    if diagnostics:
+        print(json.dumps({'script': os.path.abspath(__file__), 'ffmpeg': FFMPEG_PATH,
+                          'baseline': baseline, 'settings': SETTINGS_FILE}), flush=True)
+    diagnostic_time = 0.0
     # Prefer SIMD OpenCV paths when available
     cv2.setUseOptimized(True)
+    # Bound CPU contention between the UI and the background SR worker.
+    cv2.setNumThreads(1)
 
     print("Searching for Infiray P2 Pro via ffmpeg...")
     process, reader, cam_index = start_thermal_capture()
@@ -968,12 +1095,14 @@ def main():
         print("Starting video stream.")
     print("Controls:")
     print("  'q' - Quit   'p' - Next Palette   'm' - Min/Max pointers   'd' - Debug")
-    print("  SPACE - Freeze frame   's' - Snapshot   'f' - Celsius/Fahrenheit")
+    print("  SPACE - Freeze frame   's' - Snapshot (+ HQ if buffer full)   'f' - Celsius/Fahrenheit")
     print("  '1'-'9' '!@#$%^&' - Palette 1-16 (LUT)   'z' - Invert palette   '0' - Temp range cycle: Auto / Room / Wide")
     print("  'r' - ROI: draw rectangle for min/max/avg   'a' - High temp alarm")
     print("  'h' - High quality: DDE (Detail Enhancement) & Sharpening")
-    print("  '['/']' - Decrease/Increase DDE Contrast   '-'/'=' - Decrease/Increase Sharpness")
-    print("  'c' - FPN correction (running)   'x' - FPN from one frame   'i' - Help")
+    print("  'e' - Adaptive SR 2x: static details in background, fresh frame on motion")
+    print("  '{' / DYN - Color + details on/off; '['/']' or '('/')' - gain 0-4")
+    print("  '['/']' - DYN gain (else DDE contrast; RGB on: zoom)   '-'/'=' - Sharpness")
+    print("  'c' - FPN (scene-based NUC, pan to learn)   'x' - Flat-field cal   'i' - Help")
     print("  'l' - Line profile   't' - Isotherms   'v' - Delta-T mode")
     print("  'w' - Temp trend   'b' - Histogram   'n' - Anomaly detection")
     print("  Left/Right arrows - Rotate 90 deg   Up/Down arrows - Flip vertical/horizontal")
@@ -1004,6 +1133,9 @@ def main():
     last_seen_raw_bytes = None    # skip reprocessing / FPS inflation on duplicate frames
     _clahe = None                 # reused CLAHE (recreated when clip limit changes)
     _clahe_clip = None
+    dynamic_contrast_enabled = True
+    dynamic_gain = 2.0
+    dynamic_contrast = DynamicContrast()
     _ui_canvas = None             # reusable image+status+toolbar buffer (avoids vstack alloc)
     _frozen_cache = {'sig': None, 'img': None, 'image_h': 0}  # composed frozen canvas, rebuilt on state change
     virtual_cam_enabled = False  # 'u': send processed stream to virtual webcam (OBS on macOS)
@@ -1014,23 +1146,22 @@ def main():
     # DDE Parameters
     dde_clip_limit = 0.0     # Contrast amount (0 = no change); meaning depends on contrast_mode
     contrast_mode = 'gamma'  # 'off' | 'gamma' | 'percentile' | 'clahe'
-    dde_sharp_strength = 8.0 # Sharpness strength for Unsharp Mask
+    dde_sharp_strength = 3.0 # Unsharp at the end; keep mild so NETD is not boosted
     dde_sharp_sigma = 1.2    # Sharpness radius
 
-    # FPN (fixed-pattern noise) correction: running per-pixel calibration
+    # FPN: scene-based NUC, learns column/row/pixel offsets only under pan (C)
     fpn_enabled = False
-    fpn_corrector = FPNCorrector((192, 256), alpha=0.995)
-    # One-frame FPN: capture current frame on X, apply that offset to all following frames; X again = reset
-    single_frame_fpn_enabled = False
-    single_frame_offset_map = None  # float64 (192,256), offset to subtract each frame
-    # Thermal de-noise: temporal EMA + Edge-Gated Local Mean (preserves edges)
+    fpn_corrector = FPNCorrector((192, 256))
+    # Flat-field calibration (X): average frames on a uniform target, subtract the map
+    flatfield_enabled = False
+    flatfield = FlatFieldCalibrator((192, 256))
+    # Thermal de-noise: MC-Kalman + Edge-Gated Local Mean (preserves edges)
     denoise_enabled = False
     denoiser = ThermalDenoiser((192, 256))
     ibp_upscale_enabled = False  # Iterative Back-Projection (training-free, good for thermal)
     ibp_strength = 10  # 1–10: max at 10 (30 iters, lam 1.4)
-    burst_sr_enabled = False  # multi-frame SR from subpixel shifts (Samsung-style)
-    burst_sr = BurstSR((192, 256), scale=SCALE, max_frames=12)
-    last_raw_bottom_half = None    # last raw thermal frame, for X capture
+    burst_sr_enabled = True  # adaptive static-region reconstruction, E compares on/off
+    burst_sr = AdaptiveSR((192, 256), scale=SCALE, max_frames=16)
 
     # RGB camera blend state
     rgb_cam_enabled = False        # 'o': toggle second (RGB) camera overlay
@@ -1148,7 +1279,10 @@ def main():
             if event == cv2.EVENT_LBUTTONDOWN:
                 bid = _toolbar_find_button(x, y - toolbar_y0, _tb_display_dims[0])
                 if bid and bid in _TOOLBAR_KEY_MAP:
-                    _toolbar_injected_key[0] = _TOOLBAR_KEY_MAP[bid]
+                    if dynamic_contrast_enabled and bid in ('cont_dn', 'cont_up'):
+                        _toolbar_injected_key[0] = ord('(' if bid == 'cont_dn' else ')')
+                    else:
+                        _toolbar_injected_key[0] = _TOOLBAR_KEY_MAP[bid]
             elif event == cv2.EVENT_MOUSEMOVE:
                 _tb_hover_id[0] = _toolbar_find_button(x, y - toolbar_y0, _tb_display_dims[0])
             return
@@ -1274,6 +1408,16 @@ def main():
     palette_idx        = _saved.get('palette_idx', palette_idx)
     palette_invert     = _saved.get('palette_invert', palette_invert)
     contrast_mode      = _saved.get('contrast_mode', contrast_mode)
+    dynamic_contrast_enabled = _saved.get('dynamic_contrast_enabled', dynamic_contrast_enabled)
+    dynamic_gain       = _saved.get('dynamic_gain', dynamic_gain)
+    # First use of the new mode starts with the recommended palette. Explicit
+    # later palette choices and an explicit DYN-off preference remain saved.
+    if 'dynamic_contrast_enabled' not in _saved or '--dynamic-contrast' in sys.argv:
+        dynamic_contrast_enabled = True
+        palette_idx = next((i for i, (name, _) in enumerate(PALETTES) if name == 'Turbo'), palette_idx)
+    palette_name = PALETTES[palette_idx][0]
+    if dynamic_contrast_enabled:
+        dynamic_contrast.prepare(PALETTES[palette_idx][1])
     dde_clip_limit     = _saved.get('dde_clip_limit', dde_clip_limit)
     dde_sharp_strength = _saved.get('dde_sharp_strength', dde_sharp_strength)
     dde_sharp_sigma    = _saved.get('dde_sharp_sigma', dde_sharp_sigma)
@@ -1284,12 +1428,28 @@ def main():
     flip_h             = _saved.get('flip_h', flip_h)
     flip_v             = _saved.get('flip_v', flip_v)
     ibp_strength       = _saved.get('ibp_strength', ibp_strength)
+    burst_sr_enabled   = _saved.get('burst_sr_enabled', burst_sr_enabled)
+    if '--sr' in sys.argv:
+        burst_sr_enabled = True
     alarm_threshold    = _saved.get('alarm_threshold', alarm_threshold)
     rgb_blend_mode     = _saved.get('rgb_blend_mode', rgb_blend_mode)
     rgb_alpha          = _saved.get('rgb_alpha', rgb_alpha)
     rgb_hot_min        = _saved.get('rgb_hot_min', rgb_hot_min)
     denoiser.strength  = _saved.get('denoise_strength', denoiser.strength)
     rgb_aligner.set_zoom(_saved.get('rgb_zoom', rgb_aligner.get_zoom()))
+    # Flat-field map survives restarts: re-enable only if the saved map loads.
+    if _saved.get('flatfield_enabled') and flatfield.load(FLATFIELD_FILE):
+        flatfield_enabled = True
+
+    # Isolate capture/temperature decoding from all optional processing and
+    # persisted measurement/display preferences, without overwriting them.
+    if baseline:
+        burst_sr_enabled = dynamic_contrast_enabled = high_quality_mode = False
+        fpn_enabled = flatfield_enabled = denoise_enabled = ibp_upscale_enabled = False
+        use_fahrenheit = palette_invert = False
+        range_preset = 0
+        palette_idx = next(i for i, (name, _) in enumerate(PALETTES) if name == 'Turbo')
+        palette_name = PALETTES[palette_idx][0]
 
     _tray_stopped = [False]
 
@@ -1318,20 +1478,113 @@ def main():
     reconnect_attempt = 0
     last_reconnect_try = 0.0
     capture_opener = None    # CaptureOpener while an open attempt is in flight
+    usb_hint = format_unavailable_hint() if process is None else ""
     capture_started_at = time.monotonic() if process is not None else 0.0
     last_display_img = None  # last live frame for reconnect overlay
     last_image_h = HEIGHT    # height of the image area inside last_display_img
+    last_temp_hr = None      # float °C at display size, for cursor + HQ snapshot
+    last_delta_hr = None
+    last_rgb_w = None
+    range_min, range_max = 15.0, 35.0
+    rgb_guided_active = False
     loop_errors = 0
     last_loop_error = 0.0
     MAX_LOOP_ERRORS = 10
+
+    def _contrast_gray(gray):
+        nonlocal _clahe, _clahe_clip
+        if not high_quality_mode or dde_clip_limit <= 0 or contrast_mode == 'off':
+            return gray
+        if contrast_mode == 'gamma':
+            x = gray.astype(np.float32) * (1.0 / 255.0)
+            gamma = 0.5 + dde_clip_limit * 0.15
+            return (np.power(np.clip(x, 1e-6, 1.0), gamma) * 255).astype(np.uint8)
+        if contrast_mode == 'percentile':
+            lo = float(np.percentile(gray, 2))
+            hi = float(np.percentile(gray, 98))
+            if hi <= lo:
+                return gray
+            stretched = ((gray.astype(np.float32) - lo) / (hi - lo) * 255).clip(0, 255).astype(np.uint8)
+            alpha = min(1.0, dde_clip_limit / 5.0)
+            return (gray.astype(np.float32) * (1 - alpha) + stretched.astype(np.float32) * alpha).astype(np.uint8)
+        if _clahe is None or _clahe_clip != dde_clip_limit:
+            _clahe = cv2.createCLAHE(clipLimit=dde_clip_limit, tileGridSize=(8, 8))
+            _clahe_clip = dde_clip_limit
+        return _clahe.apply(gray)
+
+    def _tone_map_hr(temp_hr, delta_hr=None):
+        """Float °C (display size) → BGR colormap. 8-bit mapping happens here, last."""
+        if dynamic_contrast_enabled:
+            field, lo, hi = temp_hr, range_min, range_max
+            if delta_hr is not None:
+                field = delta_hr
+                span = max(abs(float(field.min())), abs(float(field.max())), 0.1)
+                lo, hi = -span, span
+            return dynamic_contrast.render(field, lo, hi, PALETTES[palette_idx][1],
+                                           gain=dynamic_gain, invert=palette_invert)
+        if delta_hr is not None:
+            abs_range = max(abs(float(delta_hr.min())), abs(float(delta_hr.max())), 0.1)
+            gray = np.clip((delta_hr + abs_range) / (2 * abs_range) * 255, 0, 255).astype(np.uint8)
+        else:
+            gray = temp_to_uint8(temp_hr, range_min, range_max)
+        gray = _contrast_gray(gray)
+        if high_quality_mode and dde_sharp_strength > 0 and not burst_sr_enabled:
+            gray = unsharp_mask(gray, sigma=dde_sharp_sigma, strength=dde_sharp_strength)
+        _palette_name, colormap_flag = PALETTES[palette_idx]
+        to_map = (255 - gray) if palette_invert else gray
+        return cv2.applyColorMap(to_map, colormap_flag)
+
+    def _render_hq_snapshot():
+        if not burst_sr_enabled:
+            return None
+        hq = burst_sr.get_hq()
+        if hq is None:
+            return None
+        return apply_rotate_flip(_tone_map_hr(hq))
+
+    def _blend_rgb(image, rgb_w):
+        if rgb_w is None or not rgb_cam_enabled:
+            return image
+        if rgb_blend_mode == 'full':
+            return cv2.addWeighted(rgb_w, rgb_alpha, image, 1.0 - rgb_alpha, 0)
+        hot = (temp_celsius >= rgb_hot_min).astype(np.uint8) * 255
+        hot_up = cv2.resize(hot, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.GaussianBlur(hot_up, (21, 21), 0).astype(np.float32)[:, :, None] / 255.0
+        return (image.astype(np.float32) * mask + rgb_w.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
+
+    def _draw_thermal_overlays(image):
+        """Shared live/frozen overlays so tone controls also work on a freeze."""
+        if isotherm_enabled:
+            draw_isotherms(image, temp_celsius, range_min, range_max, SCALE, use_fahrenheit)
+        if anomaly_enabled:
+            draw_anomaly_overlay(image, temp_celsius, 2.0, SCALE, use_fahrenheit)
+        if show_min_max:
+            sd = screen_down_in_logical()
+            draw_pin_marker(image, (max_x, max_y), (40, 60, 255), sd, size=PIN_SIZE)
+            draw_pin_marker(image, (min_x, min_y), (255, 140, 40), (-sd[0], -sd[1]), size=PIN_SIZE)
+        cv2.drawMarker(image, (mouse_x, mouse_y), (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
+        if roi_state['start'] and roi_state['end']:
+            x1, x2 = sorted((roi_state['start'][0], roi_state['end'][0]))
+            y1, y2 = sorted((roi_state['start'][1], roi_state['end'][1]))
+            x1, x2, y1, y2 = max(0, x1), min(WIDTH, x2), max(0, y1), min(HEIGHT, y2)
+            if x2 > x1 and y2 > y1:
+                cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        if alarm_enabled and max_temp >= alarm_threshold:
+            cv2.rectangle(image, (0, 0), (WIDTH - 1, HEIGHT - 1), (0, 0, 255), 4)
+        if line_profile_mode and line_profile['start'] and line_profile['end']:
+            if line_profile.get('dragging'):
+                cv2.line(image, line_profile['start'], line_profile['end'], (0, 255, 255), 2, cv2.LINE_AA)
+            else:
+                draw_line_profile_markers(image, line_profile['start'], line_profile['end'])
 
     def apply_live_keys(from_frozen=False):
         """Apply all queued keys. Returns False if the app should quit."""
         nonlocal palette_idx, range_preset, show_min_max, debug_mode, frozen, frozen_frame
         nonlocal use_fahrenheit, palette_invert, line_profile_mode, alarm_enabled
         nonlocal high_quality_mode, dde_clip_limit, contrast_mode, dde_sharp_strength
+        nonlocal dynamic_contrast_enabled, dynamic_gain, palette_name, range_min, range_max
         nonlocal show_controls_overlay, virtual_cam_enabled, fpn_enabled
-        nonlocal single_frame_fpn_enabled, single_frame_offset_map
+        nonlocal flatfield_enabled
         nonlocal isotherm_enabled, delta_t_enabled, delta_t_reference
         nonlocal trend_enabled, histogram_enabled, anomaly_enabled
         nonlocal denoise_enabled, ibp_upscale_enabled, burst_sr_enabled, ibp_strength
@@ -1340,6 +1593,8 @@ def main():
 
         while _pending_keys:
             key = _pending_keys.popleft()
+            old_tone = (palette_idx, palette_invert, dynamic_contrast_enabled, dynamic_gain,
+                        range_preset, high_quality_mode, dde_clip_limit, contrast_mode, dde_sharp_strength)
             if key in KEY_QUIT:
                 return False
             elif key in KEY_PALETTE:
@@ -1397,6 +1652,10 @@ def main():
                 if shot is not None:
                     saved = save_snapshot(shot)
                     print(f"Saved {saved}" if saved else "Snapshot failed: could not write file")
+                hq_img = _render_hq_snapshot()
+                if hq_img is not None:
+                    saved_hq = save_snapshot(hq_img, suffix='_hq')
+                    print(f"Saved HQ {saved_hq}" if saved_hq else "HQ snapshot failed")
             elif key in KEY_FAHRENHEIT:
                 use_fahrenheit = not use_fahrenheit
             elif key in KEY_PALETTE_INVERT:
@@ -1413,14 +1672,27 @@ def main():
                 alarm_enabled = not alarm_enabled
             elif key in KEY_HQ:
                 high_quality_mode = not high_quality_mode
+            elif key in KEY_DYNAMIC_CONTRAST:
+                dynamic_contrast_enabled = not dynamic_contrast_enabled
+                dynamic_contrast.reset_range()
+            elif key in KEY_DYNAMIC_DOWN:
+                dynamic_gain = max(0.0, dynamic_gain - 0.25)
+            elif key in KEY_DYNAMIC_UP:
+                dynamic_gain = min(4.0, dynamic_gain + 0.25)
             elif key in KEY_RGB_ZOOM_OUT and rgb_cam_enabled:
                 rgb_aligner.set_zoom(rgb_aligner.get_zoom() - 0.05)
             elif key in KEY_RGB_ZOOM_IN and rgb_cam_enabled:
                 rgb_aligner.set_zoom(rgb_aligner.get_zoom() + 0.05)
             elif key in KEY_BRACKET_L:
-                dde_clip_limit = max(0.0, dde_clip_limit - 0.5)
+                if dynamic_contrast_enabled:
+                    dynamic_gain = max(0.0, dynamic_gain - 0.25)
+                else:
+                    dde_clip_limit = max(0.0, dde_clip_limit - 0.5)
             elif key in KEY_BRACKET_R:
-                dde_clip_limit += 0.5
+                if dynamic_contrast_enabled:
+                    dynamic_gain = min(4.0, dynamic_gain + 0.25)
+                else:
+                    dde_clip_limit = min(10.0, dde_clip_limit + 0.5)
             elif key in KEY_CONTRAST_MODE:
                 contrast_mode = {'off': 'gamma', 'gamma': 'percentile', 'percentile': 'clahe', 'clahe': 'off'}[contrast_mode]
             elif key in KEY_SHARP_MINUS:
@@ -1439,18 +1711,19 @@ def main():
                     _virtual_cam[0] = None
             elif key in KEY_FPN:
                 fpn_enabled = not fpn_enabled
+                burst_sr.reset()
                 if not fpn_enabled:
                     fpn_corrector.reset()
             elif key in KEY_FPN_ONE:
-                if single_frame_fpn_enabled:
-                    single_frame_fpn_enabled = False
-                    single_frame_offset_map = None
+                burst_sr.reset()
+                # Flat-field: X starts a fresh calibration (aim at a uniform
+                # surface), X during calibration cancels it, X while on = off.
+                if flatfield.calibrating:
+                    flatfield.cancel()
+                elif flatfield_enabled:
+                    flatfield_enabled = False
                 else:
-                    if last_raw_bottom_half is not None:
-                        single_frame_offset_map = (
-                            last_raw_bottom_half.astype(np.float64) - np.mean(last_raw_bottom_half)
-                        ).astype(np.float64)
-                        single_frame_fpn_enabled = True
+                    flatfield.start()
             elif key in KEY_LINE_PROFILE:
                 line_profile_mode = not line_profile_mode
                 if line_profile_mode:
@@ -1480,6 +1753,9 @@ def main():
                 anomaly_enabled = not anomaly_enabled
             elif key in KEY_DENOISE:
                 denoise_enabled = not denoise_enabled
+                if denoise_enabled:
+                    burst_sr_enabled = False
+                    burst_sr.reset()
                 if not denoise_enabled:
                     denoiser.reset()
             elif key in KEY_DENOISE_DOWN:
@@ -1488,10 +1764,15 @@ def main():
                 denoiser.adjust(denoiser.STRENGTH_STEP)
             elif key in KEY_IBP_UPSCALE:
                 ibp_upscale_enabled = not ibp_upscale_enabled
+                if ibp_upscale_enabled:
+                    burst_sr_enabled = False
+                    burst_sr.reset()
             elif key in KEY_BURST_SR:
                 burst_sr_enabled = not burst_sr_enabled
-                if not burst_sr_enabled:
-                    burst_sr.reset()
+                burst_sr.reset()
+                if burst_sr_enabled:
+                    denoise_enabled = ibp_upscale_enabled = False
+                    denoiser.reset()
             elif key in KEY_IBP_STRENGTH_DOWN:
                 ibp_strength = max(1, ibp_strength - 1)
             elif key in KEY_IBP_STRENGTH_UP:
@@ -1537,30 +1818,39 @@ def main():
                 flip_v = not flip_v
             elif key in KEY_ARROW_DOWN:
                 flip_h = not flip_h
+            palette_name = PALETTES[palette_idx][0]
+            new_tone = (palette_idx, palette_invert, dynamic_contrast_enabled, dynamic_gain,
+                        range_preset, high_quality_mode, dde_clip_limit, contrast_mode, dde_sharp_strength)
+            if old_tone != new_tone:
+                if range_preset != old_tone[4]:
+                    dynamic_contrast.reset_range()
+                if from_frozen and last_temp_hr is not None:
+                    if range_preset == 1:
+                        range_min, range_max = 15.0, 35.0
+                    elif range_preset == 2:
+                        range_min, range_max = -20.0, 150.0
+                    elif range_preset != old_tone[4]:
+                        range_min, range_max = float(temp_celsius.min()), float(temp_celsius.max())
+                    frozen_frame = _blend_rgb(_tone_map_hr(last_temp_hr, last_delta_hr), last_rgb_w)
+                    _draw_thermal_overlays(frozen_frame)
         return True
 
     while running:
         try:
             # --- Auto-reconnect: EOF/dead reader or stalled stream ---
-            stream_dead = reader is None or not reader.running
-            stalled = False
-            if reader is not None and reader.running:
-                age = reader.seconds_since_frame()
-                if age is not None and age > STALL_TIMEOUT_S:
-                    stalled = True
-                elif age is None and capture_started_at > 0 and (time.monotonic() - capture_started_at) > STALL_TIMEOUT_S:
-                    # Opened but never delivered a frame
-                    stalled = True
-
-            if stream_dead or stalled:
-                if not reconnecting or stalled:
-                    reason = "stalled (no frames)" if stalled else "disconnected"
+            now = time.monotonic()
+            reason = capture_health(reader, capture_started_at, now)
+            if reason:
+                was_live = not reconnecting
+                if was_live or reason != "disconnected":
                     print(f"Camera {reason} — reconnecting...")
                 if reader is not None or process is not None:
                     stop_thermal_capture(process, reader)
                     process, reader = None, None
                 reconnecting = True
                 capture_started_at = 0.0
+                if was_live:
+                    last_reconnect_try = 0.0  # first retry immediately after a drop
 
             if reconnecting:
                 now = time.monotonic()
@@ -1572,11 +1862,16 @@ def main():
                     capture_opener.start()
                 if capture_opener is not None and capture_opener.done.is_set():
                     process, reader, cam_index = capture_opener.result
+                    if capture_opener.hint:
+                        usb_hint = capture_opener.hint
                     capture_opener = None
-                    last_reconnect_try = time.monotonic()  # back off from the end of the attempt
+                    last_reconnect_try = time.monotonic()
                     if process is not None:
                         capture_started_at = time.monotonic()
+                        usb_hint = ""
                         print(f"Camera found (index {cam_index}), waiting for frames...")
+                        # wait_for_frame already blocked until a frame (or failure).
+                        # If one is here, drop the overlay this iteration.
 
                 # Overlay on last frame (or black placeholder)
                 if last_display_img is not None:
@@ -1595,9 +1890,35 @@ def main():
                 cv2.addWeighted(dim, 0.55, recon_img, 0.45, 0, recon_img)
                 msg = f"Reconnecting... (attempt {reconnect_attempt})"
                 (tw, th), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                cv2.putText(recon_img, msg, ((rw - tw) // 2, img_h // 2),
+                cy = img_h // 2
+                cv2.putText(recon_img, msg, ((rw - tw) // 2, cy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA)
-                cv2.putText(recon_img, "Q to quit", ((rw - 80) // 2, img_h // 2 + 32),
+                if usb_hint:
+                    hint = usb_hint
+                    if len(hint) > 54:
+                        # Prefer a break after the period / dash.
+                        cut = hint.find(' — ')
+                        if cut == -1:
+                            cut = hint.find('. ')
+                        if cut > 0:
+                            line1, line2 = hint[:cut].strip(' —.'), hint[cut:].lstrip(' —. ')
+                        else:
+                            line1, line2 = hint[:54], hint[54:]
+                        (tw1, _), _ = cv2.getTextSize(line1, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+                        (tw2, _), _ = cv2.getTextSize(line2, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+                        cv2.putText(recon_img, line1, ((rw - tw1) // 2, cy + 32),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1, cv2.LINE_AA)
+                        cv2.putText(recon_img, line2, ((rw - tw2) // 2, cy + 54),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1, cv2.LINE_AA)
+                        qy = cy + 80
+                    else:
+                        (tw1, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+                        cv2.putText(recon_img, hint, ((rw - tw1) // 2, cy + 36),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 220, 255), 1, cv2.LINE_AA)
+                        qy = cy + 62
+                else:
+                    qy = cy + 32
+                cv2.putText(recon_img, "Q to quit", ((rw - 80) // 2, qy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
                 cv2.imshow(window_name, recon_img)
                 poll_keys(50)
@@ -1627,7 +1948,8 @@ def main():
                 frozen_sig = (
                     id(frozen_frame), rotation_deg, flip_h, flip_v, show_controls_overlay,
                     palette_name, high_quality_mode, contrast_mode, dde_clip_limit,
-                    dde_sharp_strength, single_frame_fpn_enabled, fpn_enabled,
+                    dynamic_contrast_enabled, dynamic_gain,
+                    dde_sharp_strength, flatfield_enabled, flatfield.calibrating, fpn_enabled,
                     denoise_enabled, denoiser.strength, ibp_upscale_enabled, ibp_strength,
                     burst_sr_enabled, delta_t_enabled, isotherm_enabled, anomaly_enabled,
                     show_min_max, use_fahrenheit, palette_invert, roi_state['active'],
@@ -1665,7 +1987,7 @@ def main():
                     cv2.putText(display_frozen, "--- CONTROLS (I to close) ---", (20, y0), font, 0.55, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
                     cv2.putText(display_frozen, "Q - Quit   P - Next palette   M - Min/Max   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                     cv2.putText(display_frozen, "SPACE - Resume   S - Snapshot   F - C/F", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                    cv2.putText(display_frozen, "1-9 !@#$%^& - Palette 1-16   0 - Range   R - ROI   A - Alarm   H - DDE   [ ] = - DDE   I - Help", (20, y0), font, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+                    cv2.putText(display_frozen, "{ / DYN - Color + details   C- / C+ or ( ) - gain   P - Palette   0 - Range", (20, y0), font, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
                 if virtual_cam_enabled and _virtual_cam[0] is not None:
                     if not _send_to_virtual_cam(display_frozen, "frozen"):
                         virtual_cam_enabled = False
@@ -1673,13 +1995,15 @@ def main():
                 cont_label = "Off" if contrast_mode == 'off' or dde_clip_limit <= 0 else ("CLAHE" if contrast_mode == 'clahe' else contrast_mode.capitalize())
                 frozen_status_state = {
                     'palette_name': palette_name, 'high_quality_mode': high_quality_mode,
+                    'dynamic_contrast_enabled': dynamic_contrast_enabled, 'dynamic_gain': dynamic_gain,
                     'cont_label': cont_label, 'dde_clip_limit': dde_clip_limit, 'dde_sharp_strength': dde_sharp_strength,
-                    'single_frame_fpn_enabled': single_frame_fpn_enabled, 'fpn_enabled': fpn_enabled,
+                    'ffc_text': ffc_status_text(flatfield, flatfield_enabled), 'fpn_enabled': fpn_enabled,
                     'denoise_enabled': denoise_enabled, 'denoiser_strength': denoiser.strength if denoise_enabled else 0,
                     'ibp_upscale_enabled': ibp_upscale_enabled, 'ibp_strength': ibp_strength,
                     'burst_sr_enabled': burst_sr_enabled, 'burst_frame_count': burst_sr.frame_count if burst_sr_enabled else 0,
+                    'sr_status': burst_sr.status,
                     'delta_t_enabled': delta_t_enabled, 'isotherm_enabled': isotherm_enabled, 'anomaly_enabled': anomaly_enabled,
-                    'fps_text': '— FPS',
+                    'rgb_guided': rgb_guided_active, 'fps_text': '— FPS',
                 }
                 fstatus_strip = np.zeros((STATUS_BAR_H, df_w, 3), dtype=np.uint8)
                 display_frozen = np.vstack([display_frozen, fstatus_strip])
@@ -1690,8 +2014,9 @@ def main():
                     'iso': isotherm_enabled, 'hist': histogram_enabled,
                     'trend': trend_enabled, 'anomaly': anomaly_enabled,
                     'delta': delta_t_enabled, 'alarm': alarm_enabled,
-                    'dde': high_quality_mode, 'fpn': fpn_enabled,
-                    'fpn1': single_frame_fpn_enabled, 'dnz': denoise_enabled,
+                    'dynamic': dynamic_contrast_enabled,
+                    'dde': high_quality_mode and not dynamic_contrast_enabled, 'fpn': fpn_enabled,
+                    'fpn1': flatfield_enabled or flatfield.calibrating, 'dnz': denoise_enabled,
                     'ibp': ibp_upscale_enabled, 'burst': burst_sr_enabled,
                     'flip_v': flip_v, 'flip_h': flip_h, 'vcam': virtual_cam_enabled,
                     'rgb': rgb_cam_enabled,
@@ -1735,33 +2060,37 @@ def main():
             frame_count += 1
             fps_times.append(time.perf_counter())
 
-            # Convert bottom half to 16-bit array (one copy; last_raw shares until FPN reassigns)
-            bottom_half_bytes = raw_bytes[256 * 192 * 2:]
-            bottom_half = np.frombuffer(bottom_half_bytes, dtype=np.uint16).reshape((192, 256)).copy()
-            last_raw_bottom_half = bottom_half
+            bottom_half = decode_thermal_frame(raw_bytes)
+            if diagnostics:
+                sensor_min_c = float(bottom_half.min()) / 64.0 - 273.15
+                sensor_max_c = float(bottom_half.max()) / 64.0 - 273.15
 
-            # One-frame FPN: subtract offset from captured frame (X) to all frames
-            if single_frame_fpn_enabled and single_frame_offset_map is not None:
-                bottom_half = np.clip(
-                    bottom_half.astype(np.float32) - single_frame_offset_map, 0, 65535
-                ).astype(np.uint16)
+            # Flat-field calibration (X): first accumulate frames of the uniform
+            # target; once the map is ready it is subtracted from every frame.
+            if flatfield.calibrating:
+                if flatfield.feed(bottom_half):
+                    flatfield_enabled = True
+                    flatfield.save(FLATFIELD_FILE)
+                    burst_sr.reset()
+            elif flatfield_enabled:
+                bottom_half = flatfield.apply(bottom_half)
 
-            # Running FPN correction (removes fixed per-pixel offset pattern over time)
+            # Scene-based FPN (C): column/row/pixel NUC, gated on pan.
             if fpn_enabled:
+                before_updates = fpn_corrector.n_updates
                 bottom_half = fpn_corrector.apply(bottom_half)
+                if before_updates != fpn_corrector.n_updates:
+                    burst_sr.reset()
 
-            # Calculate temperature (float32 is enough and faster than float64)
+            # Temperature in float °C. NR/SR stay in float; 8-bit mapping is last.
             temp_celsius = bottom_half.astype(np.float32) * (1.0 / 64.0) - np.float32(273.15)
             raw_min_c = float(temp_celsius.min())
             raw_max_c = float(temp_celsius.max())
-            # Filter out obvious outliers
-            temp_celsius = np.clip(temp_celsius, -20, 150)
 
-            # Temporal + spatial de-noise (G)
-            if denoise_enabled:
-                temp_celsius = denoiser.apply(temp_celsius)
+            # Preserve original radiometry and subpixel samples. Measurements
+            # use this field; optional smoothing is confined to the display.
+            display_temp = denoiser.apply(temp_celsius) if denoise_enabled else temp_celsius
 
-            # Min/max in two passes (argmin/argmax) instead of four (min+max+argmin+argmax)
             min_flat = int(temp_celsius.argmin())
             max_flat = int(temp_celsius.argmax())
             min_temp = float(temp_celsius.flat[min_flat])
@@ -1772,141 +2101,83 @@ def main():
                 range_min, range_max = -20.0, 150.0
             else:
                 range_min, range_max = min_temp, max_temp
+                if dynamic_contrast_enabled and not delta_t_enabled:
+                    range_min, range_max = dynamic_contrast.stabilize_range(range_min, range_max)
 
             min_y, min_x = divmod(min_flat, temp_celsius.shape[1])
             max_y, max_x = divmod(max_flat, temp_celsius.shape[1])
             min_x, min_y = min_x * SCALE, min_y * SCALE
             max_x, max_y = max_x * SCALE, max_y * SCALE
 
-            # Normalize to 8-bit BEFORE upscaling
-            delta_display = None
-            if delta_t_enabled and delta_t_reference is not None:
-                delta_display = temp_celsius - delta_t_reference
-                abs_range = max(abs(float(delta_display.min())), abs(float(delta_display.max())), 0.1)
-                normalized_small = ((delta_display + abs_range) / (2 * abs_range) * 255).astype(np.uint8)
-            elif range_max > range_min:
-                normalized_small = (
-                    (temp_celsius - range_min) * (np.float32(255.0) / np.float32(range_max - range_min))
-                ).astype(np.uint8)
-            else:
-                normalized_small = np.zeros_like(temp_celsius, dtype=np.uint8)
+            if burst_sr_enabled and not flatfield.calibrating:
+                burst_sr.push(temp_celsius)
 
-            # Upscale
-            if high_quality_mode:
-                # DDE (Digital Detail Enhancement) for Thermal Images
-                # 1. Contrast: gamma (global), percentile (global), or CLAHE (local)
-                if dde_clip_limit > 0 and contrast_mode != 'off':
-                    x = normalized_small.astype(np.float32) * (1.0 / 255.0)
-                    if contrast_mode == 'gamma':
-                        gamma = 0.5 + dde_clip_limit * 0.15
-                        enhanced = (np.power(np.clip(x, 1e-6, 1), gamma) * 255).astype(np.uint8)
-                    elif contrast_mode == 'percentile':
-                        lo = float(np.percentile(normalized_small, 2))
-                        hi = float(np.percentile(normalized_small, 98))
-                        if hi > lo:
-                            stretched = ((normalized_small.astype(np.float32) - lo) / (hi - lo) * 255).clip(0, 255).astype(np.uint8)
-                        else:
-                            stretched = normalized_small
-                        alpha = min(1.0, dde_clip_limit / 5.0)
-                        enhanced = (normalized_small.astype(np.float32) * (1 - alpha) + stretched.astype(np.float32) * alpha).astype(np.uint8)
-                    else:  # clahe (local adaptive) — reuse instance across frames
-                        if _clahe is None or _clahe_clip != dde_clip_limit:
-                            _clahe = cv2.createCLAHE(clipLimit=dde_clip_limit, tileGridSize=(8, 8))
-                            _clahe_clip = dde_clip_limit
-                        enhanced = _clahe.apply(normalized_small)
-                else:
-                    enhanced = normalized_small
-
-                # 2. Upscale: Burst SR (E) | IBP (Y) | Lanczos4
-                if burst_sr_enabled:
-                    burst_sr.push(enhanced)
-                    hr = burst_sr.get_hr()
-                    if hr is not None:
-                        normalized = hr
-                    else:
-                        normalized = cv2.resize(enhanced, (WIDTH, HEIGHT), interpolation=cv2.INTER_LANCZOS4)
-                elif ibp_upscale_enabled:
-                    n_iters = 3 + (ibp_strength - 1) * 3  # 3..30, max strength
-                    lam = 0.3 + (ibp_strength - 1) * 0.12  # 0.3..1.38
-                    normalized = ibp_upscale(enhanced, SCALE, n_iters=n_iters, lam=lam)
-                else:
-                    normalized = cv2.resize(enhanced, (WIDTH, HEIGHT), interpolation=cv2.INTER_LANCZOS4)
-
-                # 3. Aggressive sharpening to make edges pop without hallucinating
-                if dde_sharp_strength > 0:
-                    normalized = unsharp_mask(normalized, sigma=dde_sharp_sigma, strength=dde_sharp_strength)
-            else:
-                if burst_sr_enabled:
-                    burst_sr.push(normalized_small)
-                    hr = burst_sr.get_hr()
-                    if hr is not None:
-                        normalized = hr
-                    else:
-                        normalized = cv2.resize(normalized_small, (WIDTH, HEIGHT), interpolation=cv2.INTER_CUBIC)
-                elif ibp_upscale_enabled:
-                    n_iters = 3 + (ibp_strength - 1) * 3
-                    lam = 0.3 + (ibp_strength - 1) * 0.12
-                    normalized = ibp_upscale(normalized_small, SCALE, n_iters=n_iters, lam=lam)
-                else:
-                    normalized = cv2.resize(normalized_small, (WIDTH, HEIGHT), interpolation=cv2.INTER_CUBIC)
-
-            # Apply selected palette
-            palette_name, colormap_flag = PALETTES[palette_idx]
-            to_map = (255 - normalized) if palette_invert else normalized
-            colormap = cv2.applyColorMap(to_map, colormap_flag)
-
-            # --- RGB camera blend ---
+            # Align RGB on a palette-independent gray thermal, then warp.
+            rgb_w = None
+            rgb_guided_active = False
             if rgb_cam_enabled and _rgb_cam[0] is not None:
                 rgb_frame_raw = _rgb_cam[0].get_frame()
                 if rgb_frame_raw is not None:
-                    # Gradient/edge-based alignment: update every N frames (ECC on gradient maps)
-                    rgb_aligner.update(rgb_frame_raw, colormap)
+                    th_gray = temp_to_uint8(temp_celsius, range_min, range_max)
+                    th_bgr = cv2.cvtColor(
+                        cv2.resize(th_gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR),
+                        cv2.COLOR_GRAY2BGR,
+                    )
+                    rgb_aligner.update(rgb_frame_raw, th_bgr)
                     if rgb_aligner.is_tracking:
                         rgb_w = rgb_aligner.warp(rgb_frame_raw, (WIDTH, HEIGHT))
-                        if rgb_blend_mode == 'full':
-                            colormap = cv2.addWeighted(
-                                rgb_w, rgb_alpha,
-                                colormap, 1.0 - rgb_alpha,
-                                0,
-                            )
-                        else:  # hot_mask: RGB is base, thermal overlaid at hot pixels
-                            hot = (temp_celsius >= rgb_hot_min).astype(np.uint8) * 255
-                            hot_up = cv2.resize(hot, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
-                            mask = cv2.GaussianBlur(hot_up, (21, 21), 0).astype(np.float32) / 255.0
-                            mask3 = mask[:, :, np.newaxis]
-                            colormap = (
-                                colormap.astype(np.float32) * mask3
-                                + rgb_w.astype(np.float32) * (1.0 - mask3)
-                            ).astype(np.uint8)
 
-            if isotherm_enabled:
-                draw_isotherms(colormap, temp_celsius, range_min, range_max, SCALE, use_fahrenheit)
+            # Float upsample: burst SR / IBP / Lanczos, then optional RGB-guided refine.
+            delta_display = None
+            delta_hr = None
+            if delta_t_enabled and delta_t_reference is not None:
+                delta_display = temp_celsius - delta_t_reference
+            if burst_sr_enabled and not flatfield.calibrating:
+                temp_hr = burst_sr.get_hr()
+                if temp_hr is None:
+                    temp_hr = upsample_float(temp_celsius, SCALE)
+            elif ibp_upscale_enabled:
+                n_iters = 3 + (ibp_strength - 1) * 3
+                lam = 0.3 + (ibp_strength - 1) * 0.12
+                temp_hr = ibp_upscale_float(display_temp, SCALE, n_iters=n_iters, lam=lam)
+            else:
+                interp = cv2.INTER_LANCZOS4 if high_quality_mode else cv2.INTER_CUBIC
+                temp_hr = cv2.resize(
+                    display_temp, (WIDTH, HEIGHT), interpolation=interp
+                ).astype(np.float32)
 
-            if anomaly_enabled:
-                draw_anomaly_overlay(colormap, temp_celsius, 2.0, SCALE, use_fahrenheit)
+            if rgb_w is not None and not burst_sr_enabled:
+                temp_hr = refine_with_rgb_guide(temp_hr, rgb_w)
+                rgb_guided_active = True
 
-            # Get temperature at mouse cursor
-            if 0 <= mouse_x < WIDTH and 0 <= mouse_y < HEIGHT:
-                cursor_temp = temp_celsius[mouse_y // SCALE, mouse_x // SCALE]
+            last_temp_hr = temp_hr
+            last_rgb_w = rgb_w
+
+            if delta_display is not None:
+                delta_hr = cv2.resize(
+                    delta_display, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR
+                ).astype(np.float32)
+
+            palette_name, _colormap_flag = PALETTES[palette_idx]
+            colormap = _tone_map_hr(temp_hr, delta_hr)
+
+            last_delta_hr = delta_hr
+            colormap = _blend_rgb(colormap, rgb_w)
+
+            # Reconstructed detail is an estimate. Cursor/ROI/profile readings
+            # remain native calibrated observations, never invented HR values.
+            if 0 <= mouse_y < temp_hr.shape[0] and 0 <= mouse_x < temp_hr.shape[1]:
+                cursor_temp = float(temp_celsius[mouse_y // SCALE, mouse_x // SCALE])
             else:
                 cursor_temp = 0.0
-        
-            if show_min_max:
-                _sd = screen_down_in_logical()
-                _su = (-_sd[0], -_sd[1])
-                # MAX is labelled above the point, so its body sits above and the
-                # tip points down at it; MIN is labelled below and points up.
-                draw_pin_marker(colormap, (max_x, max_y), (40, 60, 255), _sd, size=PIN_SIZE)
-                draw_pin_marker(colormap, (min_x, min_y), (255, 140, 40), _su, size=PIN_SIZE)
         
             if trend_enabled:
                 trend_data.append(cursor_temp)
 
             # Draw crosshair at cursor (text drawn on display later)
-            cv2.drawMarker(colormap, (mouse_x, mouse_y), (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
             cursor_label = format_temp(cursor_temp, use_fahrenheit)
-            if delta_display is not None:
-                d = delta_display[mouse_y // SCALE, mouse_x // SCALE]
+            if delta_hr is not None and 0 <= mouse_y < delta_hr.shape[0] and 0 <= mouse_x < delta_hr.shape[1]:
+                d = float(delta_hr[mouse_y, mouse_x])
                 cursor_label += f" ({'+' if d >= 0 else ''}{d:.1f})"
         
             roi_stats = None   # (x1, y1, roi_min, roi_avg, roi_max) for the label below
@@ -1921,19 +2192,12 @@ def main():
                     roi_temps = temp_celsius[sy1:sy2, sx1:sx2]
                     roi_stats = (x1, y1, float(np.min(roi_temps)),
                                  float(np.mean(roi_temps)), float(np.max(roi_temps)))
-                    cv2.rectangle(colormap, (x1, y1), (x2, y2), (0, 255, 255), 2)
-            if alarm_enabled and max_temp >= alarm_threshold:
-                cv2.rectangle(colormap, (0, 0), (WIDTH - 1, HEIGHT - 1), (0, 0, 255), 4)
 
             # FPS: only new frames are timestamped above; (n-1)/elapsed is the unbiased rate
             fps = compute_fps(fps_times)
             fps_text = f"{fps:.1f} FPS"
 
-            if line_profile_mode and line_profile['start'] and line_profile['end']:
-                if line_profile.get('dragging'):
-                    cv2.line(colormap, line_profile['start'], line_profile['end'], (0, 255, 255), 2, cv2.LINE_AA)
-                else:
-                    draw_line_profile_markers(colormap, line_profile['start'], line_profile['end'])
+            _draw_thermal_overlays(colormap)
 
             display_img = apply_rotate_flip(colormap)
             dh, dw = display_img.shape[:2]
@@ -1991,21 +2255,21 @@ def main():
                 font, fs = cv2.FONT_HERSHEY_SIMPLEX, 0.5
                 cv2.putText(display_img, "--- CONTROLS (I to close) ---", (20, y0), font, 0.55, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "Q - Quit   P - Next palette   M - Min/Max markers   D - Debug", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "SPACE - Freeze frame   S - Snapshot   F - Celsius/Fahrenheit", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "SPACE - Freeze   S - Snapshot (+HQ if buffer full)   F - C/F", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "1-9 !@#$%^& - Palette 1-16   P - Next   Z - Invert   0 - Temp range: Auto / Room / Wide", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "R - ROI: draw rectangle (min/avg/max)   A - High temp alarm", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "H - High quality: DDE + Sharpening", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "[ ] - DDE Contrast   } - Mode: gamma/percentile/CLAHE   - = - Sharpness", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "C - FPN correction (running calibration)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "X - One-frame FPN: capture current frame, apply to all; X again = reset", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "G - De-noise (EGLM)  < > (or , .) - denoise strength", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "Y - IBP upscale   J / K - IBP strength (1-10)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "E - Burst SR (multi-frame from subpixel shifts, Samsung-style)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "{ / DYN - Color + details   [ ] or ( ) - gain 0-4   H - legacy HQ", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "DYN off: [ ] - DDE contrast   } - mode   - = - sharpness", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "C - FPN: scene-based NUC (pan to learn column/pixel offsets)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "X - Flat-field cal: aim at uniform surface (wall), ~2 s; X again = off", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "G - De-noise (MC-Kalman + EGLM)  < > (or , .) - strength", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "Y - IBP upscale (float)   J / K - IBP strength (1-10)", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "E - Adaptive SR 2x: static areas only; S saves ready HQ; gentle microshift", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "L - Line profile   T - Isotherms   V - Delta-T mode", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "W - Temp trend   B - Histogram   N - Anomaly detection", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "Left/Right - Rotate 90 deg   Up/Down - Flip V/H", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "U - Virtual webcam (OBS) for Zoom/Telegram/Teams", (20, y0), font, fs, (220, 220, 220), 1, cv2.LINE_AA); y0 += line_h
-                cv2.putText(display_img, "O - Toggle RGB camera blend   / - Reset gradient alignment", (20, y0), font, fs, (255, 200, 100), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, "O - RGB blend + guided thermal edges   / - Reset alignment", (20, y0), font, fs, (255, 200, 100), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "; - Blend mode   ` / ~ - alpha +/-   ' \\ - hot thresh   [ ] - RGB zoom (when O on)", (20, y0), font, fs, (255, 200, 100), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, "I - Show/hide this help", (20, y0), font, fs, (200, 255, 200), 1)
 
@@ -2032,11 +2296,18 @@ def main():
                 cv2.putText(display_img, f"bottom_half shape: {bottom_half.shape}  dtype: {bottom_half.dtype}", (15, y0), font, fs, (200, 200, 255), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, f"temp_celsius shape: {temp_celsius.shape}", (15, y0), font, fs, (200, 200, 255), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, f"high_quality_mode: {high_quality_mode} (DDE Sharpness)", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, f"DYN: {dynamic_contrast_enabled}  gain: {dynamic_gain:.2f}  {dynamic_contrast.render_ms:.1f} ms", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+                if fpn_enabled:
+                    _fpn_rms = float(np.sqrt(np.mean(fpn_corrector.offset_map ** 2)))
+                    cv2.putText(display_img, f"FPN updates: {fpn_corrector.n_updates}  offset RMS: {_fpn_rms:.1f} raw", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
                 rgb_dbg = (f"RGB cam: {'ON' if rgb_cam_enabled else 'OFF'}"
                            f"  tracking: {rgb_aligner.is_tracking}"
+                           f"  guided: {rgb_guided_active}"
                            f"  mode: {rgb_blend_mode}"
                            f"  alpha: {rgb_alpha:.2f}"
                            f"  hot_min: {rgb_hot_min:.0f}C  {rgb_aligner.status_text}")
+                cv2.putText(display_img, f"{burst_sr.status} | frames {burst_sr.frame_count}/{burst_sr.max_frames} | phase {burst_sr.diversity:.2f}", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
+                cv2.putText(display_img, f"SR tracking {burst_sr.frontend_ms:.1f} ms | worker {burst_sr.solve_ms:.0f} ms | native temperature readings", (15, y0), font, fs, (200, 255, 200), 1, cv2.LINE_AA); y0 += line_h
                 cv2.putText(display_img, rgb_dbg, (15, y0), font, fs, (255, 200, 100), 1, cv2.LINE_AA)
 
                 # Gradient debug: show what we match (thermal vs RGB Sobel magnitude)
@@ -2108,13 +2379,15 @@ def main():
             cont_label = "Off" if contrast_mode == 'off' or dde_clip_limit <= 0 else ("CLAHE" if contrast_mode == 'clahe' else contrast_mode.capitalize())
             status_state = {
                 'palette_name': palette_name, 'high_quality_mode': high_quality_mode,
-                'cont_label': cont_label, 'dde_clip_limit': dde_clip_limit, 'dde_sharp_strength': dde_sharp_strength,
-                'single_frame_fpn_enabled': single_frame_fpn_enabled, 'fpn_enabled': fpn_enabled,
+                'dynamic_contrast_enabled': dynamic_contrast_enabled, 'dynamic_gain': dynamic_gain,
+                    'cont_label': cont_label, 'dde_clip_limit': dde_clip_limit, 'dde_sharp_strength': dde_sharp_strength,
+                'ffc_text': ffc_status_text(flatfield, flatfield_enabled), 'fpn_enabled': fpn_enabled,
                 'denoise_enabled': denoise_enabled, 'denoiser_strength': denoiser.strength if denoise_enabled else 0,
                 'ibp_upscale_enabled': ibp_upscale_enabled, 'ibp_strength': ibp_strength,
                 'burst_sr_enabled': burst_sr_enabled, 'burst_frame_count': burst_sr.frame_count if burst_sr_enabled else 0,
+                    'sr_status': burst_sr.status,
                 'delta_t_enabled': delta_t_enabled, 'isotherm_enabled': isotherm_enabled, 'anomaly_enabled': anomaly_enabled,
-                'fps_text': fps_text,
+                'rgb_guided': rgb_guided_active, 'fps_text': fps_text,
             }
             tb_states = {
                 'minmax': show_min_max, 'freeze': frozen, 'fahr': use_fahrenheit,
@@ -2122,8 +2395,9 @@ def main():
                 'iso': isotherm_enabled, 'hist': histogram_enabled,
                 'trend': trend_enabled, 'anomaly': anomaly_enabled,
                 'delta': delta_t_enabled, 'alarm': alarm_enabled,
-                'dde': high_quality_mode, 'fpn': fpn_enabled,
-                'fpn1': single_frame_fpn_enabled, 'dnz': denoise_enabled,
+                'dynamic': dynamic_contrast_enabled,
+                    'dde': high_quality_mode and not dynamic_contrast_enabled, 'fpn': fpn_enabled,
+                'fpn1': flatfield_enabled or flatfield.calibrating, 'dnz': denoise_enabled,
                 'ibp': ibp_upscale_enabled, 'burst': burst_sr_enabled,
                 'flip_v': flip_v, 'flip_h': flip_h, 'vcam': virtual_cam_enabled,
                 'rgb': rgb_cam_enabled,
@@ -2141,6 +2415,21 @@ def main():
             last_image_h = dh
             _frozen_cache['sig'] = None   # a fresh live frame invalidates the frozen canvas
             cv2.imshow(window_name, _ui_canvas)
+            if diagnostics and time.monotonic() - diagnostic_time >= 2.0:
+                diagnostic_time = time.monotonic()
+                print(json.dumps({'frame': frame_count, 'fps': round(fps, 2),
+                                  'sr': burst_sr.status, 'frames': burst_sr.frame_count,
+                                  'coverage': round(burst_sr.coverage, 3),
+                                  'phase': round(burst_sr.diversity, 3),
+                                  'dynamic': dynamic_contrast_enabled, 'gain': dynamic_gain,
+                                  'sensor_c': [round(sensor_min_c, 2), round(sensor_max_c, 2)],
+                                  'measured_c': [round(raw_min_c, 2), round(raw_max_c, 2)],
+                                  'cursor_c': round(float(cursor_temp), 2),
+                                  'fahrenheit': use_fahrenheit, 'ffc': flatfield_enabled,
+                                  'fpn': fpn_enabled,
+                                  'contrast_ms': round(dynamic_contrast.render_ms, 2),
+                                  'tracking_ms': round(burst_sr.frontend_ms, 2),
+                                  'solver_ms': round(burst_sr.solve_ms, 1)}), flush=True)
 
             poll_keys(1)
             if window_closed():
@@ -2167,28 +2456,34 @@ def main():
                 break
 
     # --- Shutdown: settings first, they are what the user would miss ---
-    save_app_settings({
-        'palette_idx': palette_idx,
-        'palette_invert': palette_invert,
-        'contrast_mode': contrast_mode,
-        'dde_clip_limit': dde_clip_limit,
-        'dde_sharp_strength': dde_sharp_strength,
-        'dde_sharp_sigma': dde_sharp_sigma,
-        'high_quality_mode': high_quality_mode,
-        'use_fahrenheit': use_fahrenheit,
-        'range_preset': range_preset,
-        'rotation_deg': rotation_deg,
-        'flip_h': flip_h,
-        'flip_v': flip_v,
-        'denoise_strength': denoiser.strength,
-        'ibp_strength': ibp_strength,
-        'alarm_threshold': alarm_threshold,
-        'rgb_blend_mode': rgb_blend_mode,
-        'rgb_alpha': rgb_alpha,
-        'rgb_hot_min': rgb_hot_min,
-        'rgb_zoom': rgb_aligner.get_zoom(),
-    })
+    if not baseline:
+        save_app_settings({
+            'palette_idx': palette_idx,
+            'palette_invert': palette_invert,
+            'contrast_mode': contrast_mode,
+            'dynamic_contrast_enabled': dynamic_contrast_enabled,
+            'dynamic_gain': dynamic_gain,
+            'dde_clip_limit': dde_clip_limit,
+            'dde_sharp_strength': dde_sharp_strength,
+            'dde_sharp_sigma': dde_sharp_sigma,
+            'high_quality_mode': high_quality_mode,
+            'use_fahrenheit': use_fahrenheit,
+            'range_preset': range_preset,
+            'rotation_deg': rotation_deg,
+            'flip_h': flip_h,
+            'flip_v': flip_v,
+            'denoise_strength': denoiser.strength,
+            'flatfield_enabled': flatfield_enabled,
+            'ibp_strength': ibp_strength,
+            'burst_sr_enabled': burst_sr_enabled,
+            'alarm_threshold': alarm_threshold,
+            'rgb_blend_mode': rgb_blend_mode,
+            'rgb_alpha': rgb_alpha,
+            'rgb_hot_min': rgb_hot_min,
+            'rgb_zoom': rgb_aligner.get_zoom(),
+        })
     save_panel_layout(panels)
+    burst_sr.close()
 
     if _rgb_cam[0] is not None:
         _rgb_cam[0].stop()
