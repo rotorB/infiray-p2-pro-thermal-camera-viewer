@@ -115,6 +115,9 @@ namespace P2Pro
                 var head = ThermalCamera.HeadPoseAt(_rgb.TimeNs);
                 var lens = _rgb.Intrinsics.LensOffset;
                 var ours = new Pose(head.position + head.rotation * lens.position, head.rotation * lens.rotation);
+                // OVRPlugin poses are in tracking space, PassthroughCameraAccess's in world space.
+                var depth = Genesis.RoomScan.DepthCapture.Instance;
+                if (depth != null) ours = depth.TrackingToWorld(ours);
                 var theirs = _rgb.CameraPose;
                 poseCheck = $"{Vector3.Distance(ours.position, theirs.position) * 1000:F1} mm / " +
                             $"{Quaternion.Angle(ours.rotation, theirs.rotation):F2} deg";

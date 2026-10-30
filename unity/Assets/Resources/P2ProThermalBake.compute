@@ -1,0 +1,384 @@
+// Builds the persistent thermal map of the room, the °C counterpart of QuestRoomScan's
+// triplanar colour cache. Each map covers the scan volume along two world axes; its lower half
+// holds surfaces facing the negative third axis, the upper half the positive one.
+// Texel: x = °C, y = confidence (0 = empty), z = position along the third axis (volume 0..1).
+// A tag map of the same layout holds, per texel, up to four keyframes that saw it
+// (ThermalKeyframes tags, 0 = none): P2Pro/ThermalMesh averages them at full resolution.
+//
+// Bake runs per thermal frame over the environment depth pixels: each surface point is
+// splatted onto the map of its dominant normal axis; every texel of the splat is placed on the
+// point's tangent plane and looked up in the thermal image on its own, so the map keeps the
+// thermal camera's detail and follows the surface angle. Seen texels keep a running average
+// (the first view is taken as is, later ones by weight, so a texel settles over a second or
+// two instead of following each frame); unseen ones keep their last value. The same pass
+// collects how the frame differs from that average, for the flat-field correction
+// (P2ProFlatField.compute).
+#include "Packages/com.genesis.roomscan/Runtime/Shaders/DepthKit.hlsl"
+#include "Packages/com.genesis.roomscan/Runtime/Shaders/VolumeHelpers.hlsl"
+#include "Assets/Shaders/P2ProThermalLens.hlsl"
+#include "Assets/Shaders/P2ProFlatOffset.hlsl"
+
+RWTexture2D<float4> _MapXZ;
+RWTexture2D<float4> _MapXY;
+RWTexture2D<float4> _MapYZ;
+RWTexture2D<float4> _TagXZ;
+RWTexture2D<float4> _TagXY;
+RWTexture2D<float4> _TagYZ;
+uint2 _MapSize;
+// Histogram of the temperatures held in the maps, for the Scene palette range.
+#define HIST_BINS 960
+#define HIST_MIN -40.0
+#define HIST_STEP 0.25
+RWStructuredBuffer<uint> _Histogram;
+
+Texture2D<float> _Temperature;          // °C, row 0 at the bottom
+float4x4 _WorldToRgb;                   // world -> headset RGB camera at the thermal frame's time
+float3 _RgbPosition;
+float4 _RgbIntrinsics;                  // fx, fy, cx, cy (sensor pixels)
+float4 _RgbCrop;                        // image rectangle within the sensor
+float4 _MapA;                           // Align-mode mapping = A + B / distance (roll in radians)
+float4 _MapB;
+// Confidence a texel's running average stops growing at: a new frame then still weighs at
+// least quality / (MAX_CONFIDENCE + quality).
+#define MAX_CONFIDENCE 10
+float _MaxDistance;
+float _KeyframeTag;                     // keyframe holding this frame, -1 = not kept
+
+// As ThermalKeyframes.Params: to pick the keyframes a texel names, and to count the texels
+// naming each keyframe.
+struct Keyframe
+{
+    float4 row0, row1, row2;            // world -> RGB camera
+    float4 position;                    // RGB camera; w = tag, 0 = empty slot
+    float4 intrinsics;
+    float4 crop;
+    float4 mapA;
+    float4 mapB;
+    float4 info;                        // x = time taken
+};
+#define KEYFRAMES 128
+StructuredBuffer<Keyframe> _Keyframes;
+RWStructuredBuffer<uint> _KeyframeUse;
+
+// Flat field (as P2ProFlatField.compute): per cell of a grid over the thermal image, the sum
+// (millidegrees) and count of frame minus running average, where the average is reliable and
+// the image is locally flat (no edge, where alignment errors would count as sensor error).
+RWStructuredBuffer<int> _FlatSum;
+RWStructuredBuffer<uint> _FlatCount;
+float _FlatLearn;                       // 1 = collect
+#define FLAT_MIN_CONFIDENCE 2
+#define FLAT_MAX_GRADIENT 0.5           // °C across 4 camera pixels
+#define FLAT_MAX_RESIDUAL 2.0
+float _Now;                             // same clock as Keyframe.info.x
+// Centrality a keyframe loses per second of age, so fresh views replace old ones over time
+// (about 0.6 a minute).
+#define KEYFRAME_AGE_RATE 0.01
+// Weight of the outer rim of the image in the map's running °C: the sensor reads unevenly
+// towards its edges.
+#define EDGE_WEIGHT 0.05
+
+#define MIN_FACING 0.3
+#define DEPTH_EDGE 0.05
+#define MAX_SPLAT 4
+
+// Thermal texture coordinate of a world point, or (-1, -1) outside the thermal image.
+float2 ThermalUv(float3 world)
+{
+    float3 c = mul(_WorldToRgb, float4(world, 1)).xyz;
+    float2 uv;
+    bool seen = ThermalUvOf(c, _RgbIntrinsics, _RgbCrop, _MapA, _MapB, uv);
+    return seen && all(uv > 0.005) && all(uv < 0.995) ? uv : float2(-1, -1);
+}
+
+// 1 at the image centre, 0 at its edge.
+float Centrality(float2 uv)
+{
+    float2 d = abs(uv - 0.5) * 2;
+    return 1 - max(d.x, d.y);
+}
+
+// Thermal texture coordinate of a world point in a stored keyframe, or (-1, -1) outside it.
+// Same projection as ThermalUv.
+float2 KeyframeUv(Keyframe k, float3 world)
+{
+    float4 p = float4(world, 1);
+    float3 c = float3(dot(k.row0, p), dot(k.row1, p), dot(k.row2, p));
+    float2 uv;
+    bool seen = ThermalUvOf(c, k.intrinsics, k.crop, k.mapA, k.mapB, uv);
+    return seen && all(uv >= 0) && all(uv <= 1) ? uv : float2(-1, -1);
+}
+
+// The four keyframes a texel keeps, with this keyframe frame (which sees the texel's point p at
+// `centrality`) in place of the weakest one if it is better. A keyframe's score is how near
+// its image centre it saw p, less its age; replaced or empty slots score lowest.
+// Score of a held keyframe tag at p; replaced, empty or not seeing p: -1.
+float KeyframeScore(float tag, float3 p)
+{
+    if (tag < 0.5) return -1;
+    Keyframe k = _Keyframes[((uint)round(tag) - 1) % KEYFRAMES];
+    if (abs(k.position.w - tag) > 0.25) return -1;
+    float2 uv = KeyframeUv(k, p);
+    return uv.x < 0 ? -1 : Centrality(uv) - (_Now - k.info.x) * KEYFRAME_AGE_RATE;
+}
+
+float4 InsertKeyframe(float4 tags, float3 p, float centrality)
+{
+    if (any(abs(tags - _KeyframeTag) < 0.25)) return tags;          // already held
+    float4 score = float4(KeyframeScore(tags.x, p), KeyframeScore(tags.y, p),
+                          KeyframeScore(tags.z, p), KeyframeScore(tags.w, p));
+    float weakest = min(min(score.x, score.y), min(score.z, score.w));
+    if (centrality <= weakest) return tags;
+    if (score.x == weakest) tags.x = _KeyframeTag;
+    else if (score.y == weakest) tags.y = _KeyframeTag;
+    else if (score.z == weakest) tags.z = _KeyframeTag;
+    else tags.w = _KeyframeTag;
+    return tags;
+}
+
+// Bilinear by hand: linear filtering of 32-bit float textures is optional on mobile GPUs.
+float Celsius(float2 uv)
+{
+    uint w, h;
+    _Temperature.GetDimensions(w, h);   // 256 x 192, or 3x that when sharpened
+    int2 size = int2(w, h);
+    float2 p = uv * (float2)size - 0.5;
+    int2 i = (int2)floor(p);
+    float2 f = p - i;
+    int2 i0 = clamp(i, 0, size - 1);
+    int2 i1 = clamp(i + 1, 0, size - 1);
+    float bottom = lerp(_Temperature.Load(int3(i0.x, i0.y, 0)), _Temperature.Load(int3(i1.x, i0.y, 0)), f.x);
+    float top = lerp(_Temperature.Load(int3(i0.x, i1.y, 0)), _Temperature.Load(int3(i1.x, i1.y, 0)), f.x);
+    return lerp(bottom, top, f.y);
+}
+
+// A vector in map order (u axis, v axis, normal axis) and back. axis: 1 = XZ map, 2 = XY, 0 = YZ.
+float3 ToMap(float3 v, int axis) { return axis == 1 ? v.xzy : axis == 2 ? v.xyz : v.yzx; }
+float3 FromMap(float3 m, int axis) { return axis == 1 ? m.xzy : axis == 2 ? m.xyz : m.zxy; }
+
+#pragma kernel Clear
+
+[numthreads(8, 8, 1)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _MapSize)) return;
+    _MapXZ[id.xy] = 0;
+    _MapXY[id.xy] = 0;
+    _MapYZ[id.xy] = 0;
+    _TagXZ[id.xy] = 0;
+    _TagXY[id.xy] = 0;
+    _TagYZ[id.xy] = 0;
+}
+
+// celsius: corrected for the sensor offsets; p: the texel's surface point; centrality: where
+// it lies in this frame's image.
+void Write(int axis, uint2 texel, float celsius, float quality, float along, float3 p, float centrality)
+{
+    float4 old = axis == 1 ? _MapXZ[texel] : axis == 2 ? _MapXY[texel] : _MapYZ[texel];
+    float4 v;
+    bool fresh = old.y < 0.01 || abs(old.z - along) > 0.02;  // empty, or another surface: start over
+    quality *= lerp(EDGE_WEIGHT, 1, centrality);
+    if (fresh)
+        v = float4(celsius, quality, along, 0);
+    else
+    {
+        float confidence = min(old.y, MAX_CONFIDENCE);
+        v = float4(lerp(old.x, celsius, quality / (confidence + quality)), confidence + quality, along, 0);
+    }
+    if (axis == 1) _MapXZ[texel] = v;
+    else if (axis == 2) _MapXY[texel] = v;
+    else _MapYZ[texel] = v;
+
+    if (!fresh && _KeyframeTag < 0) return;                 // tags unchanged
+    float4 tags = fresh ? 0 : axis == 1 ? _TagXZ[texel] : axis == 2 ? _TagXY[texel] : _TagYZ[texel];
+    if (_KeyframeTag >= 0) tags = InsertKeyframe(tags, p, centrality);
+    if (axis == 1) _TagXZ[texel] = tags;
+    else if (axis == 2) _TagXY[texel] = tags;
+    else _TagYZ[texel] = tags;
+}
+
+#pragma kernel Sample
+
+// °C of the map around one world point (the controller pointer): every map and side whose
+// texels lie on this surface (same position along the normal axis), over a small
+// neighbourhood, weighted by confidence. Result: (°C, total confidence); confidence 0 = no data.
+float3 _SamplePoint;
+RWStructuredBuffer<float> _SampleResult;
+#define SAMPLE_RADIUS 2
+
+float4 ReadMap(int axis, uint2 texel) { return axis == 1 ? _MapXZ[texel] : axis == 2 ? _MapXY[texel] : _MapYZ[texel]; }
+
+[numthreads(1, 1, 1)]
+void Sample(uint3 id : SV_DispatchThreadID)
+{
+    float3 uvw = gsWorldToVoxelUVW(_SamplePoint);
+    int halfHeight = (int)(_MapSize.y / 2);
+    float sum = 0, weights = 0;
+    [loop] for (int axis = 0; axis < 3; axis++)
+    {
+        float3 m = ToMap(uvw, axis);
+        [loop] for (int side = 0; side < 2; side++)
+        {
+            int halfMin = side * halfHeight;
+            int2 centre = int2(m.x * _MapSize.x, m.y * halfHeight + halfMin);
+            [loop] for (int dy = -SAMPLE_RADIUS; dy <= SAMPLE_RADIUS; dy++)
+            [loop] for (int dx = -SAMPLE_RADIUS; dx <= SAMPLE_RADIUS; dx++)
+            {
+                int2 t = centre + int2(dx, dy);
+                if (t.x < 0 || t.x >= (int)_MapSize.x || t.y < halfMin || t.y >= halfMin + halfHeight) continue;
+                float4 v = ReadMap(axis, (uint2)t);
+                if (v.y > 0.01 && abs(v.z - m.z) < 0.02)
+                {
+                    sum += v.x * v.y;
+                    weights += v.y;
+                }
+            }
+        }
+    }
+    _SampleResult[0] = weights > 0 ? sum / weights : 0;
+    _SampleResult[1] = weights;
+}
+
+#pragma kernel ClearHistogram
+
+[numthreads(64, 1, 1)]
+void ClearHistogram(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x < HIST_BINS) _Histogram[id.x] = 0;
+    if (id.x < KEYFRAMES) _KeyframeUse[id.x] = 0;
+}
+
+// Every other texel in x and y of all three maps; one group-local histogram per group. Also
+// counts the texels naming each keyframe that still holds their tag.
+#pragma kernel Histogram
+
+groupshared uint _localHist[HIST_BINS];
+groupshared uint _localUse[KEYFRAMES];
+
+void CountKeyframe(float tag)
+{
+    if (tag < 0.5) return;
+    uint slot = ((uint)round(tag) - 1) % KEYFRAMES;
+    if (abs(_Keyframes[slot].position.w - tag) < 0.25) InterlockedAdd(_localUse[slot], 1);
+}
+
+void Count(float4 texel, float4 tags)
+{
+    if (texel.y > 0.01)
+    {
+        int bin = clamp((int)((texel.x - HIST_MIN) / HIST_STEP), 0, HIST_BINS - 1);
+        InterlockedAdd(_localHist[bin], 1);
+        CountKeyframe(tags.x);
+        CountKeyframe(tags.y);
+        CountKeyframe(tags.z);
+        CountKeyframe(tags.w);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void Histogram(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
+{
+    for (uint i = index; i < HIST_BINS; i += 64) _localHist[i] = 0;
+    for (uint k = index; k < KEYFRAMES; k += 64) _localUse[k] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    uint2 t = id.xy * 2;
+    if (all(t < _MapSize))
+    {
+        Count(_MapXZ[t], _TagXZ[t]);
+        Count(_MapXY[t], _TagXY[t]);
+        Count(_MapYZ[t], _TagYZ[t]);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint j = index; j < HIST_BINS; j += 64)
+        if (_localHist[j] > 0) InterlockedAdd(_Histogram[j], _localHist[j]);
+    for (uint u = index; u < KEYFRAMES; u += 64)
+        if (_localUse[u] > 0) InterlockedAdd(_KeyframeUse[u], _localUse[u]);
+}
+
+#pragma kernel Bake
+
+[numthreads(8, 8, 1)]
+void Bake(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= gsDepthTexSize)) return;
+    float2 texel = 1.0 / (float2)gsDepthTexSize;
+    float2 uv = ((float2)id.xy + 0.5) * texel;
+    float depth = gsDepthSample(uv);
+    if (depth <= 0.001 || depth >= 0.999) return;
+    float dL = gsDepthSample(uv - float2(texel.x, 0));
+    float dR = gsDepthSample(uv + float2(texel.x, 0));
+    float dD = gsDepthSample(uv - float2(0, texel.y));
+    float dU = gsDepthSample(uv + float2(0, texel.y));
+    if (max(max(abs(depth - dL), abs(depth - dR)), max(abs(depth - dD), abs(depth - dU))) > DEPTH_EDGE) return;
+
+    float3 world = gsDepthNDCtoWorld(float3(uv, depth));
+    if (!gsInsideRoom(world) || gsInsideAnyExclusion(world)) return;
+    float3 normal = gsDepthNormalSample(uv).xyz;
+    if (length(normal) < 0.1) return;
+    normal = normalize(normal);
+
+    float3 toPoint = world - gsDepthEyePos();
+    float dist = length(toPoint);
+    float facing = -dot(toPoint / dist, normal);
+    if (dist < 0.25 || dist > _MaxDistance || facing < MIN_FACING) return;
+    float quality = saturate(1 - dist / _MaxDistance) * facing;
+
+    // World size of this depth pixel on the surface, in map texels.
+    float3 neighbour = gsDepthNDCtoWorld(float3(uv + float2(texel.x, 0), depth));
+    float footprint = distance(neighbour, world) / facing;
+    float3 extent = (float3)gsVoxCount * gsVoxSize;
+
+    float3 n = abs(normal);
+    int axis = n.y >= n.x && n.y >= n.z ? 1 : n.z >= n.x ? 2 : 0;
+    float3 worldM = ToMap(world, axis);
+    float3 normalM = ToMap(normal, axis);
+    float3 extentM = ToMap(extent, axis);
+    float3 uvwM = ToMap(gsWorldToVoxelUVW(world), axis);
+    float2 texelSize = float2(extentM.x / _MapSize.x, extentM.y / (_MapSize.y * 0.5));
+    int radius = min(MAX_SPLAT, (int)ceil(0.5 * footprint / min(texelSize.x, texelSize.y)));
+
+    float half0 = normalM.z > 0 ? 0.5 : 0;
+    int halfMin = (int)(half0 * _MapSize.y);
+    int2 centre = int2(uvwM.x * _MapSize.x, (uvwM.y * 0.5 + half0) * _MapSize.y);
+
+    // Flat field: this frame against the room's running average at this point.
+    if (_FlatLearn > 0.5 && centre.x >= 0 && centre.x < (int)_MapSize.x &&
+        centre.y >= halfMin && centre.y < halfMin + (int)(_MapSize.y / 2))
+    {
+        float4 m = ReadMap(axis, (uint2)centre);
+        float2 tuv0 = ThermalUv(world);
+        if (tuv0.x >= 0 && m.y > FLAT_MIN_CONFIDENCE && abs(m.z - uvwM.z) < 0.02)
+        {
+            float2 d = float2(2.0 / 256, 2.0 / 192);
+            float celsius = Celsius(tuv0) - FlatOffset(tuv0);
+            float gradient = max(abs(Celsius(tuv0 + float2(d.x, 0)) - Celsius(tuv0 - float2(d.x, 0))),
+                                 abs(Celsius(tuv0 + float2(0, d.y)) - Celsius(tuv0 - float2(0, d.y))));
+            if (gradient < FLAT_MAX_GRADIENT)
+            {
+                int2 cell = clamp((int2)(tuv0 * float2(FLAT_GRID_X, FLAT_GRID_Y)), 0, int2(FLAT_GRID_X - 1, FLAT_GRID_Y - 1));
+                uint i = cell.y * FLAT_GRID_X + cell.x;
+                InterlockedAdd(_FlatSum[i], (int)round(clamp(celsius - m.x, -FLAT_MAX_RESIDUAL, FLAT_MAX_RESIDUAL) * 1000));
+                InterlockedAdd(_FlatCount[i], 1u);
+            }
+        }
+    }
+
+    [loop] for (int dy = -radius; dy <= radius; dy++)
+    [loop] for (int dx = -radius; dx <= radius; dx++)
+    {
+        int2 t = centre + int2(dx, dy);
+        if (t.x < 0 || t.x >= (int)_MapSize.x || t.y < halfMin || t.y >= halfMin + (int)(_MapSize.y / 2)) continue;
+
+        // Texel centre on the tangent plane through the point, in map order.
+        float3 pM;
+        pM.x = ((t.x + 0.5) / _MapSize.x - 0.5) * extentM.x;
+        pM.y = (((t.y + 0.5) / _MapSize.y - half0) * 2 - 0.5) * extentM.y;
+        pM.z = worldM.z - (normalM.x * (pM.x - worldM.x) + normalM.y * (pM.y - worldM.y)) / normalM.z;
+        float3 p = FromMap(pM, axis);
+
+        float2 tuv = ThermalUv(p);
+        if (tuv.x < 0) continue;
+        Write(axis, (uint2)t, Celsius(tuv) - FlatOffset(tuv), quality, ToMap(gsWorldToVoxelUVW(p), axis).z, p, Centrality(tuv));
+    }
+}

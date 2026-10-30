@@ -1,4 +1,5 @@
 // Maps a temperature texture (°C, single channel) through a 256x1 palette between _Min and _Max.
+// _Alpha < 1 draws it as a see-through overlay (use a transparent render queue for that).
 // Lives in Resources so the build includes it although only code creates its material.
 Shader "P2Pro/Thermal"
 {
@@ -8,6 +9,7 @@ Shader "P2Pro/Thermal"
         _Palette ("Palette", 2D) = "white" {}
         _Min ("Range min (°C)", Float) = 15
         _Max ("Range max (°C)", Float) = 35
+        _Alpha ("Opacity", Range(0, 1)) = 1
     }
     SubShader
     {
@@ -15,6 +17,7 @@ Shader "P2Pro/Thermal"
         Pass
         {
             Cull Off
+            Blend SrcAlpha OneMinusSrcAlpha, One OneMinusSrcAlpha
             HLSLPROGRAM
             #pragma vertex vert
             #pragma fragment frag
@@ -27,6 +30,7 @@ Shader "P2Pro/Thermal"
                 float4 _MainTex_ST;
                 float _Min;
                 float _Max;
+                float _Alpha;
             CBUFFER_END
 
             struct Attributes
@@ -57,7 +61,7 @@ Shader "P2Pro/Thermal"
             {
                 float celsius = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, i.uv).r;
                 float t = saturate((celsius - _Min) / max(_Max - _Min, 0.01));
-                return half4(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(t, 0.5)).rgb, 1);
+                return half4(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(t, 0.5)).rgb, _Alpha);
             }
             ENDHLSL
         }

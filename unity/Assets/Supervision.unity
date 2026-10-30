@@ -929,7 +929,7 @@ MonoBehaviour:
   mrcActivationMode: 0
   launchSimultaneousHandsControllersOnStartup: 0
   isInsightPassthroughEnabled: 1
-  shouldBoundaryVisibilityBeSuppressed: 0
+  shouldBoundaryVisibilityBeSuppressed: 1
   requestBodyTrackingPermissionOnStartup: 0
   requestFaceTrackingPermissionOnStartup: 0
   requestEyeTrackingPermissionOnStartup: 0
@@ -1694,9 +1694,9 @@ MonoBehaviour:
   m_EditorClassIdentifier: Genesis.RoomScan::Genesis.RoomScan.VolumeIntegrator
   compute: {fileID: 7200000, guid: 6bdf7fc95400b4f52aae8f59e74a4905, type: 3}
   voxelCount:
-    x: 256
-    y: 256
-    z: 256
+    x: 384
+    y: 128
+    z: 384
   voxelSize: 0.05
   voxelDistance: 0.15
   voxelMin: 0.1

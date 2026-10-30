@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -7,7 +8,7 @@ namespace Genesis.RoomScan
     /// Renders the GPU Surface Nets mesh via Graphics.RenderPrimitivesIndirect.
     /// Replaces per-chunk MeshFilter+MeshRenderer with a single indirect draw call.
     /// </summary>
-    internal class GPUMeshRenderer : MonoBehaviour
+    public class GPUMeshRenderer : MonoBehaviour
     {
         [SerializeField] private Material gpuMeshMaterial;
 
@@ -20,6 +21,12 @@ namespace Genesis.RoomScan
         private static readonly int ID_SurfaceIndices = Shader.PropertyToID("_SurfaceIndices");
 
         private bool _renderVisible = true;
+
+        /// <summary>
+        /// Extra materials drawn over the live mesh with the same vertex and index buffers
+        /// (_SurfaceVerts, _SurfaceIndices), whatever the render mode. P2Pro patch.
+        /// </summary>
+        public static readonly List<Material> OverlayMaterials = new();
 
         /// <summary>
         /// Toggle rendering without disabling the component (which destroys state).
@@ -51,7 +58,7 @@ namespace Genesis.RoomScan
 
         private void LateUpdate()
         {
-            if (!_ready || !_renderVisible || _surfaceNets == null || gpuMeshMaterial == null)
+            if (!_ready || _surfaceNets == null || gpuMeshMaterial == null)
                 return;
 
             var vertBuf = _surfaceNets.VertexBuffer;
@@ -73,7 +80,14 @@ namespace Genesis.RoomScan
                 layer = gameObject.layer
             };
 
-            Graphics.RenderPrimitivesIndirect(rp, MeshTopology.Triangles, argsBuf, 1);
+            if (_renderVisible)
+                Graphics.RenderPrimitivesIndirect(rp, MeshTopology.Triangles, argsBuf, 1);
+
+            foreach (var material in OverlayMaterials)
+            {
+                rp.material = material;
+                Graphics.RenderPrimitivesIndirect(rp, MeshTopology.Triangles, argsBuf, 1);
+            }
         }
 
         private void OnDisable()

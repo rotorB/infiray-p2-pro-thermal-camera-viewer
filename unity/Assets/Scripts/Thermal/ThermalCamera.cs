@@ -40,6 +40,8 @@ namespace P2Pro
         /// <summary>Latest frame in °C, same layout as <see cref="Temperature"/>. Overwritten on the next frame.</summary>
         public float[] Celsius => _pixels;
         public string Status { get; private set; } = "Waiting for permissions";
+        /// <summary>Keeps the last frame in <see cref="Temperature"/> and <see cref="Celsius"/>; new frames are skipped.</summary>
+        public bool Paused { get; set; }
 
         /// <summary>Raised on the main thread after <see cref="Temperature"/> got a new frame.</summary>
         public event Action FrameReady;
@@ -114,7 +116,7 @@ namespace P2Pro
                 if (!_streaming) SetStatus(_usb.CallStatic<string>("getStatus"));
             }
 
-            if (!_streaming) return;
+            if (!_streaming || Paused) return;
             int result = p2pro_take_celsius(_pixels, Width, Height, _stats, out long timeNs);
             if (result < 0)
             {

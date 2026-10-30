@@ -4,20 +4,30 @@ using UnityEngine;
 namespace P2Pro
 {
     /// <summary>
-    /// 256x1 palette textures, left = coldest. Same palettes as the Kotlin viewer
-    /// (android/app/.../Palettes.kt).
+    /// 256x1 palette textures, left = coldest. The first five are the Kotlin viewer's
+    /// (android/app/.../Palettes.kt); the rest are approximations of common thermography
+    /// palettes, plus Viridis (colour-blind safe) and Hot spots (grey, top fifth red to yellow).
     /// </summary>
     public static class Palettes
     {
-        public static readonly string[] Names = { "Inferno", "Turbo", "Ironbow", "White hot", "Black hot" };
+        public static readonly string[] Names =
+        {
+            "Inferno", "Turbo", "Ironbow", "White hot", "Black hot",
+            "Rainbow", "Arctic", "Lava", "Viridis", "Hot spots",
+        };
 
         static readonly Func<float, Vector3>[] Functions =
         {
             Inferno,
             Turbo,
-            Ironbow,
+            t => Stops(IronbowStops, t),
             t => new Vector3(t, t, t),
             t => new Vector3(1 - t, 1 - t, 1 - t),
+            t => Stops(RainbowStops, t),
+            t => Stops(ArcticStops, t),
+            t => Stops(LavaStops, t),
+            Viridis,
+            HotSpots,
         };
 
         public static Texture2D Build(int index)
@@ -77,16 +87,83 @@ namespace P2Pro
             (1.00f, new Vector3(255, 255, 255)),
         };
 
-        static Vector3 Ironbow(float t)
+        static readonly (float t, Vector3 rgb)[] RainbowStops =
         {
-            for (int i = 1; i < IronbowStops.Length; i++)
+            (0.00f, new Vector3(0, 0, 0)),
+            (0.12f, new Vector3(40, 0, 120)),
+            (0.25f, new Vector3(0, 60, 255)),
+            (0.40f, new Vector3(0, 200, 220)),
+            (0.55f, new Vector3(40, 220, 40)),
+            (0.70f, new Vector3(255, 230, 0)),
+            (0.85f, new Vector3(255, 60, 0)),
+            (1.00f, new Vector3(255, 255, 255)),
+        };
+
+        // Cold surfaces in blues, warm ones in golds.
+        static readonly (float t, Vector3 rgb)[] ArcticStops =
+        {
+            (0.00f, new Vector3(5, 5, 40)),
+            (0.20f, new Vector3(20, 40, 130)),
+            (0.40f, new Vector3(40, 110, 210)),
+            (0.55f, new Vector3(120, 180, 235)),
+            (0.70f, new Vector3(225, 160, 70)),
+            (0.85f, new Vector3(255, 205, 60)),
+            (1.00f, new Vector3(255, 250, 210)),
+        };
+
+        static readonly (float t, Vector3 rgb)[] LavaStops =
+        {
+            (0.00f, new Vector3(0, 0, 0)),
+            (0.15f, new Vector3(20, 40, 90)),
+            (0.30f, new Vector3(40, 100, 140)),
+            (0.45f, new Vector3(120, 60, 160)),
+            (0.60f, new Vector3(210, 40, 80)),
+            (0.75f, new Vector3(250, 120, 20)),
+            (0.90f, new Vector3(255, 210, 60)),
+            (1.00f, new Vector3(255, 255, 230)),
+        };
+
+        static Vector3 Stops((float t, Vector3 rgb)[] stops, float t)
+        {
+            for (int i = 1; i < stops.Length; i++)
             {
-                var (t1, c1) = IronbowStops[i];
+                var (t1, c1) = stops[i];
                 if (t > t1) continue;
-                var (t0, c0) = IronbowStops[i - 1];
+                var (t0, c0) = stops[i - 1];
                 return Vector3.Lerp(c0, c1, (t - t0) / (t1 - t0)) / 255f;
             }
-            return Vector3.one;
+            return stops[^1].rgb / 255f;
+        }
+
+        // Polynomial fit of matplotlib's viridis (Matt Zucker, CC0).
+        static Vector3 Viridis(float t)
+        {
+            Vector3[] c =
+            {
+                new(0.2777273f, 0.0054073f, 0.3340998f),
+                new(0.1050930f, 1.4046135f, 1.3845902f),
+                new(-0.3308618f, 0.2148476f, 0.0950952f),
+                new(-4.6342305f, -5.7991010f, -19.3324410f),
+                new(6.2282699f, 14.1799334f, 56.6905526f),
+                new(4.7763850f, -13.7451454f, -65.3530326f),
+                new(-5.4354559f, 4.6458526f, 26.3124352f),
+            };
+            var v = c[6];
+            for (int k = 5; k >= 0; k--) v = v * t + c[k];
+            return v;
+        }
+
+        // Grey for most of the range, so the hottest fifth stands out in red to yellow.
+        static Vector3 HotSpots(float t)
+        {
+            const float Start = 0.8f;
+            if (t < Start)
+            {
+                float g = 0.1f + 0.7f * t / Start;
+                return new Vector3(g, g, g);
+            }
+            float k = (t - Start) / (1 - Start);
+            return new Vector3(1, k, k * k * 0.6f);
         }
     }
 }

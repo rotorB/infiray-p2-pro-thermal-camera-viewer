@@ -1,0 +1,59 @@
+// Distance along world rays to the first surface in QuestRoomScan's environment depth
+// (left depth eye). Marches each ray with log-spaced steps, then bisects the crossing.
+// Writes -1 when the ray leaves the depth view or hits nothing within range.
+#pragma kernel Probe
+#include "Packages/com.genesis.roomscan/Runtime/Shaders/DepthKit.hlsl"
+
+StructuredBuffer<float4> _Rays;         // origin, direction pairs
+RWStructuredBuffer<float> _Result;
+uint _RayCount;
+
+static const float MinT = 0.15;
+static const float MaxT = 8.0;
+static const int Steps = 128;
+
+// Surface depth minus the point's depth, both along the depth camera axis; > 0 in front of the
+// surface. valid = false outside the depth image.
+// Single exit: DXC warns about early returns from functions with out parameters.
+float Gap(float3 origin, float3 dir, float t, out bool valid)
+{
+    float3 ndc = gsDepthWorldToNDC(origin + dir * t, 0);
+    valid = all(ndc.xy > 0) && all(ndc.xy < 1) && ndc.z > 0 && ndc.z < 1;
+    float gap = 0;
+    if (valid) gap = gsDepthNDCToLinear(gsDepthSample(ndc.xy, 0), 0) - gsDepthNDCToLinear(ndc.z, 0);
+    return gap;
+}
+
+[numthreads(8, 1, 1)]
+void Probe(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _RayCount) return;
+    float3 origin = _Rays[id.x * 2].xyz;
+    float3 dir = normalize(_Rays[id.x * 2 + 1].xyz);
+
+    float result = -1;
+    float prevT = 0;
+    bool prevFront = false;
+    for (int i = 0; i < Steps; i++)
+    {
+        float t = MinT * pow(MaxT / MinT, i / (float)(Steps - 1));
+        bool valid;
+        float gap = Gap(origin, dir, t, valid);
+        if (!valid) { prevFront = false; continue; }
+        if (gap <= 0 && prevFront)
+        {
+            float lo = prevT, hi = t;
+            for (int b = 0; b < 12; b++)
+            {
+                float mid = 0.5 * (lo + hi);
+                bool v;
+                if (Gap(origin, dir, mid, v) > 0) lo = mid; else hi = mid;
+            }
+            result = 0.5 * (lo + hi);
+            break;
+        }
+        prevFront = gap > 0;
+        prevT = t;
+    }
+    _Result[id.x] = result;
+}

@@ -69,7 +69,7 @@ native capture code.
      with an explicit mutable `PendingIntent`, detaches the kernel driver and hands the fd to
      Unity; the AAR also carries UVCAndroid's `libuvc`, `libusb1.0`, `libjpeg-turbo212`;
    - Unity: `ThermalCamera` (permissions, stream, RFloat texture), `ThermalPanel` (panel,
-     palettes, range modes; B = palette, right stick click = range, Y = recenter).
+     palettes, range modes; B = palette, right stick click = range; Y now cycles the room mode).
    Still missing for parity: on-panel min/max/center readout and markers, rotate/mirror,
    frame timestamps for pairing with RGB and depth.
 6. Then Phase 1-4 below, implemented in Unity. For Phase 4, store temperature (not colour) in
@@ -116,71 +116,96 @@ Notes for Phase 2:
 Precondition for everything below: the P2 Pro is mounted rigidly on the headset. Any shift of
 the mount invalidates the calibration.
 
-## Phase 2: calibration mode ("Train")
+## Phase 2: alignment ("Align" mode, replaces "Train")
 
-Goal: a mapping from a thermal pixel to an RGB pixel that holds at any distance, i.e. scale,
-offset and the parallax caused by the two cameras sitting apart.
+Done in Unity 2026-10-28 (`Assets/Scripts/Alignment`), verified in the headset: one point was
+enough for a good overlay.
 
-Flow:
-1. User presses "Train" and looks at a rectangular target whose temperature differs clearly
-   from the background (heated or cooled sheet, laptop lid, a box with a hand warmer behind
-   it). On-screen hint explains this.
-2. Each frame pair: find the target's 4 corners in both images.
-   - Thermal: threshold against the background (Otsu on °C), largest contour, approximate to a
-     quadrilateral, refine corners.
-   - RGB: edges + quadrilateral search near the area predicted from the thermal corners (after
-     the first good samples), refine corners.
-   - Reject the pair if either quad is missing, too small, too skewed or blurred (motion).
-3. Distance per sample: from the Depth API at the target, or from the target's apparent size
-   once its physical size is known.
-4. The user walks closer and further away; the app collects samples across distances and
-   shows coverage (near / mid / far) and the current error.
-5. Fit:
-   - Model: thermal and RGB cameras as two pinhole cameras with fixed relative rotation R and
-     translation t. For a point at depth d the thermal->RGB mapping is
-     `H(d) = K_rgb (R + t nᵀ / d) K_th⁻¹`. Fit R, t (and refine the thermal intrinsics K_th,
-     starting from the P2 Pro nominal FOV) over all corner correspondences.
-   - Robust fit: RANSAC over samples, then least squares on the inliers; drop outlier frames.
-   - Simple fallback if the full model is unstable: per-distance homographies, interpolated by
-     depth.
-6. Report reprojection error in RGB pixels; accept the calibration only below a threshold.
-   Save it (with mount id, camera id and date) and load it on start.
+The full two-camera model (R, t, K_th) was replaced by a simpler 2D similarity per distance:
+thermal UV -> RGB viewport as offset (U, V), scale and roll, each fitted as `A + B / distance`
+(parallax). `ThermalAlignment` stores points in `persistentDataPath/thermal_alignment.json`.
 
-Open: whether to also offer a checkerboard target (heated print) for a more precise
-intrinsic calibration of the thermal camera.
+- [x] Align mode on the panel (virtual buttons, pointer rays from both controllers):
+  Calibrate -> Capture freezes both images; the stick moves, scales and rolls the thermal
+  overlay; Save point stores it with the distance from a depth ray march (`DepthProbe`).
+- [x] Automatic start: `TargetFinder` finds a warm/cold rectangle in both images (Otsu) and
+  `FitCorners` fits the similarity; the user corrects it by hand before saving.
+- [x] Undo last point, Reset all points (two-click confirm), plausibility checks on points.
+- [x] Thermal camera roll (mount rotation) is part of the fit.
+- [x] Latency: `LatencyEstimator` compares the measured image shift between thermal frames
+  (Lucas-Kanade) with the shift predicted from head poses at 0-200 ms; auto or manual
+  (+-10 ms buttons).
+- [ ] More points at near / mid / far distances to check the 1/d model.
 
-## Phase 3: Supervision 1 (raster fusion)
+## Phase 3: Supervision 1 (live thermal on the room)
 
-Thermal image warped into the RGB camera's view with the Phase 2 mapping, then blended onto the
-RGB image.
+The latest thermal frame is projected per fragment onto the room mesh (`ThermalLive`,
+P2Pro/ThermalLive) through the RGB camera pose at exposure time and the alignment, instead of
+warping a 2D image.
 
-- [ ] Warp: per frame, using the depth at the scene (single dominant depth to start, per-pixel
-  depth from the Depth API later).
-- [ ] Thermal source as palette colour or as greyscale (hotter = whiter).
-- [ ] Blend modes, switchable live:
-  - opacity (alpha slider): base mode;
-  - add, multiply, screen, subtract, difference, overlay;
-  - "hot only": thermal shown only above a temperature threshold.
-- [ ] Controls: mode, opacity, palette, temperature range, threshold.
-- [ ] Rendering: start in the 2D panel (RGB frame + overlay, accepts some latency); move to an
-  MR layer over passthrough later if latency matters.
+- [x] Room modes: Live (latest frame only), Paint (Phase 4), Off; Menu hides/shows the panel.
+- [x] Palette and range modes: Frame, Room, Wide, Scene (2-98 % of all stored °C).
+  Ten palettes (Inferno, Turbo, Ironbow, White / Black hot, Rainbow, Arctic, Lava, Viridis,
+  Hot spots).
+- [x] Controller shortcuts: Y = room mode (live, paint, flat), X = thermal surfaces / thermal
+  wireframe (hair-thin, antialiased, coloured by °C; starts on surfaces), right stick click =
+  palette, left stick click = range (Scene, Frame, Wide).
+- [x] QuestRoomScan's own mesh (RGB colours, white grid) is hidden; a depth-only pass of the
+  same mesh keeps the thermal overlays on the nearest surface.
+- [x] Overlay style (`OverlayStyle`, `P2ProOverlay.hlsl`), saved between launches:
+  - blend: alpha, add, screen, multiply;
+  - opacity 25 / 50 / 75 / 100 %;
+  - show all, only above or only below a threshold (+-1 °C buttons);
+  - greyscale through the White hot / Black hot palettes.
+- [ ] Subtract, difference, overlay blend modes, if needed.
 
 ## Phase 4: Supervision 2 (thermal room mesh)
 
-The headset builds a mesh of the room while the user walks; each mesh element gets the
-temperature measured when it was seen.
+Geometry comes from QuestRoomScan (GPU TSDF + surface nets, `GPUMeshRenderer` draws overlay
+materials over the same buffers).
 
-- [ ] Live geometry: fuse Depth API (environment depth) frames with the head pose into a TSDF
-  voxel grid, extract the mesh with marching cubes. Horizon OS's Scene mesh is static (from
-  Space Setup), so live scanning has to be built on the Depth API.
-- [ ] Thermal projection: for every new frame, project mesh vertices into the thermal camera
-  (head pose + Phase 2 extrinsics); write the temperature to vertices that are visible
-  (depth test against the current depth map) and well inside the thermal FOV.
-- [ ] Store temperature, not colour: vertex attributes `temperature`, `last_seen`,
-  `sample_count`; average or keep the latest per vertex (decide which).
-- [ ] Colour mesh edges/faces from temperature with the selected palette; palette and range
-  change live without rescanning.
-- [ ] Start/stop scan, clear, export (PLY with a temperature attribute).
+- [x] Persistent thermal texture (`ThermalMap`, P2ProThermalBake.compute): each thermal frame
+  is splatted from environment depth into three world-space triplanar maps (2048², RGBA16F,
+  texel = °C, confidence, axis position). Surfaces in view keep updating, the rest keep their
+  last value; blend weight depends on viewing angle and distance.
+- [x] Full thermal resolution on the painted room (`ThermalKeyframes`): the map's texels
+  (9 x 19 mm over a 19.2 m volume) are too coarse, so each texel also names the keyframe that
+  last saw it, and the mesh shader projects that whole stored frame like the live view.
+  128 immutable keyframes (R16F): a new one after 3 cm / 2 deg of head motion or 1 s still,
+  at most 5 a second; the slot reused is the one fewest texels still name (counted with the
+  Scene histogram). Texels whose keyframe was replaced fall back to the map's °C.
+- [x] Even painting across the sensor: a texel keeps up to four keyframes (a second set of
+  triplanar tag maps, +96 MB); a new keyframe replaces the weakest (score = centrality in that
+  image less 0.01 per second of age). The mesh shader averages the four stored frames per
+  fragment, weighted by centrality² (0 at the image edge, so views fade into each other) and a
+  60 s half-life. The map's running °C weights the image rim down to 5 %. Only what lands on
+  the room is averaged: the live thermal image is never filtered.
+- [x] Flat-field correction (`ThermalFlatField`, P2ProFlatField.compute): a 32 x 24 grid of
+  offsets learnt from the room (frame minus the map's running average where that is reliable
+  and the image is locally flat), 2 % per frame, image centre anchored at 0; subtracted only
+  where temperatures land on the room (map writes in the bake, keyframe reads in the mesh
+  shader, P2ProFlatOffset.hlsl). Panel, Live and Flat show the camera's frame unchanged. Off by default: without a restoring
+  force the offsets drifted to a 7.5 C spread and brightened the painted image edges; now they
+  decay 0.2 % a frame and are capped at 1 C. "Even" button = on/off (off -> on relearns); the log prints the left / centre / right offsets every 10 s.
+- [x] The map keeps a running average per texel (first view as is, then weighted, capped at
+  confidence 10) instead of following each frame.
+- [x] Pointer label drawn over everything (it was hidden by the overlay's sort order).
+- [x] Thermal lens model (`ThermalLens`, P2ProThermalLens.hlsl): the thermal camera as a real
+  camera in the RGB camera's frame (rotation, position, fx, fy, cx, cy, k1, k2), fitted by
+  Levenberg-Marquardt to point pairs from the Points wizard (`PointsWizard`, Calibrate ->
+  Points wizard): mark a feature on the thermal image, then on the RGB image; the RGB point's
+  3D position comes from the room depth. Rotation from four starting rolls, then intrinsics,
+  then position (pairs spanning distances) and distortion; outliers trimmed once. Once solved
+  it replaces the A + B / distance mapping in the bake, keyframes, Live, Flat (a 16 x 12
+  grid) and the latency estimate; stored with the alignment. In the wizard the thermal image
+  is shown turned like the RGB one (mapping roll), plus "Turn thermal" quarter turns
+  (remembered); display only.
+- [x] USB device filter (VID 0x0BDA / PID 0x5830) on the activity, so the system can remember
+  "always open" for the P2 Pro instead of asking for USB access every time.
+- [x] Store temperature, not colour; palette and range change live without rescanning.
+- [x] Clear map button; Scene range from a GPU histogram of the map twice a second.
+- [ ] Known limit: two parallel surfaces facing the same way share triplanar texels.
+- [ ] Save/load the scan, export (PLY with a temperature attribute).
 
 ## Open decisions
 

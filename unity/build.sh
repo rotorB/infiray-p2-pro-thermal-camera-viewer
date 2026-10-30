@@ -23,6 +23,8 @@ env -u ANDROID_HOME -u JAVA_HOME PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   -executeMethod P2Pro.Editor.QuestBuild.Build -logFile "$LOG" \
   || { grep -E "error CS|What went wrong" -A2 "$LOG" | head -20; exit 1; }
 grep "\[P2Pro\] Build" "$LOG"
+# Unity reports shader compile errors but still builds; a broken kernel then does nothing on device.
+if grep -q "Shader error in 'P2Pro" "$LOG"; then grep "Shader error in 'P2Pro" "$LOG" | sort -u; exit 1; fi
 
 ADB=(adb)
 if [ $# -gt 0 ]; then
