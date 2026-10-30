@@ -2,8 +2,9 @@
 // P2Pro/ThermalLive. A point already in the headset RGB camera's frame (c, metres) goes to the
 // thermal texture through the fitted camera model (ThermalLens: rotation, position, focal
 // lengths, principal point, radial k1 k2) when it is solved, else through the Align-mode
-// mapping A + B / distance on the RGB image (ThermalAlignment). Uniforms from
-// ThermalLens.Apply and RgbProjection.Apply.
+// mapping A + B / distance on the RGB image (ThermalAlignment). With the lens, a 16 x 12 grid
+// of offsets (thermal pixels, fitted by EdgeAlign) corrects what the model leaves, out to the
+// image corners. Uniforms from ThermalLens.Apply and RgbProjection.Apply.
 #ifndef P2PRO_THERMAL_LENS_INCLUDED
 #define P2PRO_THERMAL_LENS_INCLUDED
 
@@ -11,6 +12,30 @@ float _LensOn;
 float4 _LensRow0, _LensRow1, _LensRow2; // RGB camera frame -> thermal camera frame (w = offset)
 float4 _LensK;                          // fx, fy, cx, cy in thermal pixels, y up
 float4 _LensD;                          // k1, k2, image width, height in pixels
+float _LensGridOn;
+#define LENS_GRID_X 16
+#define LENS_GRID_Y 12
+float4 _LensGrid[LENS_GRID_X * LENS_GRID_Y / 2];   // two cells (x, y offsets) per element
+
+float2 LensGridCell(int2 c)
+{
+    c = clamp(c, int2(0, 0), int2(LENS_GRID_X - 1, LENS_GRID_Y - 1));
+    int i = c.y * LENS_GRID_X + c.x;
+    float4 v = _LensGrid[i >> 1];
+    return (i & 1) ? v.zw : v.xy;
+}
+
+// Offset (thermal pixels) to add at a model pixel, bilinear between cell centres; 0 without a grid.
+float2 LensGridOffset(float2 px)
+{
+    if (_LensGridOn < 0.5) return 0;
+    float2 g = px / _LensD.zw * float2(LENS_GRID_X, LENS_GRID_Y) - 0.5;
+    int2 i = (int2)floor(g);
+    float2 f = g - i;
+    float2 bottom = lerp(LensGridCell(i), LensGridCell(i + int2(1, 0)), f.x);
+    float2 top = lerp(LensGridCell(i + int2(0, 1)), LensGridCell(i + int2(1, 1)), f.x);
+    return lerp(bottom, top, f.y);
+}
 float _RgbAspect;
 float _ThermalAspect;
 
@@ -29,7 +54,8 @@ bool ThermalUvOf(float3 c, float4 intrinsics, float4 crop, float4 mapA, float4 m
         float2 x = t.xy / t.z;
         float r2 = dot(x, x);
         if (r2 > 1.5) return false;     // far outside the field: the distortion polynomial folds
-        uv = (_LensK.zw + _LensK.xy * x * (1 + r2 * (_LensD.x + r2 * _LensD.y))) / _LensD.zw;
+        float2 px = _LensK.zw + _LensK.xy * x * (1 + r2 * (_LensD.x + r2 * _LensD.y));
+        uv = (px + LensGridOffset(px)) / _LensD.zw;
         return true;
     }
     float2 sensor = c.xy / c.z * intrinsics.xy + intrinsics.zw;

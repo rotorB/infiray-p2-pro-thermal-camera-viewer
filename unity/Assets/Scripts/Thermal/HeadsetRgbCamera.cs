@@ -22,7 +22,7 @@ namespace P2Pro
         public PassthroughCameraAccess Source { get; private set; }
         public Texture Texture => Source != null && Source.IsPlaying ? Source.GetTexture() : null;
         public long TimeNs { get; private set; }
-        /// <summary>Camera (lens) pose in tracking space at <see cref="TimeNs"/>.</summary>
+        /// <summary>Camera (lens) pose at <see cref="TimeNs"/>, world space (PassthroughCameraAccess.GetCameraPose).</summary>
         public Pose CameraPose { get; private set; }
         public PassthroughCameraAccess.CameraIntrinsics Intrinsics { get; private set; }
         public int FrameCount { get; private set; }

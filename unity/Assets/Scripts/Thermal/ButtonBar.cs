@@ -9,7 +9,8 @@ namespace P2Pro
     /// pulling its index trigger; a slider follows the ray while the trigger is held. Each
     /// controller draws a ray; the item under it lights up.
     /// The owner calls <see cref="Show"/> with the current items whenever they may change;
-    /// the last row sits at the bar's position and the others stack upwards.
+    /// the last row sits at the bar's position and the others stack upwards. A pressed button
+    /// flashes; a disabled one is greyed out and, when pressed, says why in <see cref="Feedback"/>.
     /// </summary>
     public class ButtonBar : MonoBehaviour
     {
@@ -18,6 +19,8 @@ namespace P2Pro
             public string Label;
             public Action OnClick;
             public bool Highlight;              // drawn in the accent colour (the main next step)
+            public bool Enabled;
+            public string Disabled;             // why it is disabled, shown when pressed anyway
             // Sliders only: value, its span along the slider, and its label.
             public Func<float> Get;
             public Action<float> Set;
@@ -26,11 +29,13 @@ namespace P2Pro
 
             public bool IsSlider => Set != null;
 
-            public Button(string label, Action onClick, bool highlight = false)
+            public Button(string label, Action onClick, bool highlight = false, bool enabled = true, string disabled = null)
             {
                 Label = label;
                 OnClick = onClick;
                 Highlight = highlight;
+                Enabled = enabled;
+                Disabled = disabled;
                 Get = null;
                 Set = null;
                 Min = Max = 0;
@@ -64,6 +69,20 @@ namespace P2Pro
         static readonly Color Accent = new(0.1f, 0.45f, 0.85f);
         static readonly Color Hover = new(0.95f, 0.6f, 0.1f);
         static readonly Color SliderFill = new(0.1f, 0.4f, 0.7f);
+        static readonly Color Off = new(0.1f, 0.1f, 0.11f);
+        static readonly Color Pressed = new(0.2f, 0.75f, 0.3f);
+        static readonly Color Refused = new(0.8f, 0.15f, 0.15f);
+        const float FlashSeconds = 0.35f;
+        const float FeedbackSeconds = 6;
+
+        Slot _flash;
+        bool _flashOk;
+        float _flashUntil;
+        string _feedback = "";
+        float _feedbackAt = -100;
+
+        /// <summary>What the last press did ("Pressed: Solve"), for a few seconds; empty after.</summary>
+        public string Feedback => Time.unscaledTime - _feedbackAt < FeedbackSeconds ? _feedback : "";
 
         Transform _root;
         float _width;
@@ -197,8 +216,13 @@ namespace P2Pro
 
             foreach (var slot in _slots)
             {
-                var colour = slot == hovered || slot == _drag ? Hover : slot.Button.Highlight ? Accent : Normal;
+                bool enabled = slot.Button.Enabled || slot.Button.IsSlider;
+                var colour = slot == _flash && Time.unscaledTime < _flashUntil ? (_flashOk ? Pressed : Refused)
+                    : slot == hovered || slot == _drag ? Hover
+                    : !enabled ? Off
+                    : slot.Button.Highlight ? Accent : Normal;
                 slot.Background.sharedMaterial = ColourMaterial(colour);
+                slot.Text.Colour = enabled ? Color.white : new Color(0.45f, 0.45f, 0.45f);
                 if (slot.Root.activeSelf && slot.Button.IsSlider) UpdateSlider(slot);
             }
         }
@@ -242,8 +266,21 @@ namespace P2Pro
                 }
                 else
                 {
-                    Debug.Log("[P2Pro] button " + slot.Button.Label);
-                    slot.Button.OnClick?.Invoke();
+                    _flash = slot;
+                    _flashUntil = Time.unscaledTime + FlashSeconds;
+                    _flashOk = slot.Button.Enabled;
+                    _feedbackAt = Time.unscaledTime;
+                    if (slot.Button.Enabled)
+                    {
+                        _feedback = "Pressed: " + slot.Button.Label;
+                        Debug.Log("[P2Pro] button " + slot.Button.Label);
+                        slot.Button.OnClick?.Invoke();
+                    }
+                    else
+                    {
+                        _feedback = $"\"{slot.Button.Label}\" is not available now" + (string.IsNullOrEmpty(slot.Button.Disabled) ? "." : ": " + slot.Button.Disabled);
+                        Debug.Log("[P2Pro] button refused: " + slot.Button.Label);
+                    }
                 }
             }
             return slot;

@@ -71,7 +71,7 @@ namespace P2Pro
             FramePairs = 0;
             Note = "";
             ClearPending();
-            _autoRoll = _alignment.TryEvaluate(AutoRollDistance, out var m) ? m.RollDeg : 0;
+            _autoRoll = _alignment.TryEvaluate(AutoRollDistance, out var m) ? m.RollDeg : _alignment.MountRollDeg;
             _panel.ThermalRoll = Roll;
         }
 
@@ -116,6 +116,11 @@ namespace P2Pro
         public void Solve()
         {
             string log = _alignment.Lens.Solve();
+            if (_alignment.Lens.Solved)
+            {
+                _alignment.Lens.MountDeg = _alignment.MountRollDeg;     // fitted as mounted now
+                _alignment.Use = (int)ThermalAlignment.Kind.Lens;       // what was just made is what is used
+            }
             _alignment.Save();
             Note = _alignment.Lens.Solved ? "Lens: " + _alignment.Lens + ". " + log : log;
             Debug.Log("[P2Pro] lens solve: " + log + (_alignment.Lens.Solved ? " -> " + _alignment.Lens : ""));

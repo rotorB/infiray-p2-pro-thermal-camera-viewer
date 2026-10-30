@@ -15,6 +15,12 @@ namespace P2Pro
         Font _font;
         bool _scaled;
 
+        public Color Colour
+        {
+            get => _text.color;
+            set { if (_text.color != value) _text.color = value; }
+        }
+
         public string Text
         {
             get => _text.text;

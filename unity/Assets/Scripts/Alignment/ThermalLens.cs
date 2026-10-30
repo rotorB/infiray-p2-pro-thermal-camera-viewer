@@ -13,6 +13,8 @@ namespace P2Pro
     /// two lenses' different perspective and distortion out to the image edges.
     /// Frames: the RGB camera's as in <see cref="RgbProjection"/> (x right, y up, z forward);
     /// thermal pixels with y up, row 0 at the bottom of the temperature texture.
+    /// On top of the model, an optional grid of offsets (<see cref="Grid"/>, fitted by
+    /// <see cref="EdgeAlign"/>) corrects what it leaves, out to the image corners.
     /// Shaders: P2ProThermalLens.hlsl, uniforms set by <see cref="Apply(ComputeShader)"/>.
     /// </summary>
     [Serializable]
@@ -35,6 +37,16 @@ namespace P2Pro
         public float Fx, Fy, Cx, Cy, K1, K2;
         public float RmsPx;
         public int Used;
+        /// <summary>Mount roll (<see cref="ThermalAlignment.MountRollDeg"/>) the model was made with; its Rotation includes it.</summary>
+        public int MountDeg;
+        public const int GridX = 16, GridY = 12;
+        /// <summary>Thermal-pixel offsets (x, y per cell, row 0 at the bottom) added to the model's pixel; empty = none.</summary>
+        public float[] Grid = Array.Empty<float>();
+
+        public bool HasGrid => Grid != null && Grid.Length == GridX * GridY * 2;
+        /// <summary>Applies the grid (set by <see cref="ThermalAlignment.Active"/>; not saved).</summary>
+        [NonSerialized] public bool UseGrid = true;
+        bool GridOn => Solved && HasGrid && UseGrid;
 
         static readonly int OnId = Shader.PropertyToID("_LensOn");
         static readonly int Row0Id = Shader.PropertyToID("_LensRow0");
@@ -42,6 +54,51 @@ namespace P2Pro
         static readonly int Row2Id = Shader.PropertyToID("_LensRow2");
         static readonly int KId = Shader.PropertyToID("_LensK");
         static readonly int DId = Shader.PropertyToID("_LensD");
+        static readonly int GridOnId = Shader.PropertyToID("_LensGridOn");
+        static readonly int GridId = Shader.PropertyToID("_LensGrid");
+        Vector4[] _gridUniform;
+
+        /// <summary>Same model, pairs and grid as a separate copy.</summary>
+        public ThermalLens Clone()
+        {
+            var c = (ThermalLens)MemberwiseClone();
+            c.Pairs = new List<Pair>(Pairs);
+            c.Grid = (float[])Grid?.Clone() ?? Array.Empty<float>();
+            c._gridUniform = null;
+            return c;
+        }
+
+        /// <summary>Takes the model and grid of <paramref name="other"/>; keeps this one's pairs.</summary>
+        public void CopyModel(ThermalLens other)
+        {
+            Solved = other.Solved;
+            Position = other.Position;
+            Rotation = other.Rotation;
+            MountDeg = other.MountDeg;
+            Fx = other.Fx; Fy = other.Fy; Cx = other.Cx; Cy = other.Cy; K1 = other.K1; K2 = other.K2;
+            RmsPx = other.RmsPx;
+            Used = other.Used;
+            Grid = (float[])other.Grid.Clone();
+            _gridUniform = null;
+        }
+
+        /// <summary>Grid offset at a model pixel (bilinear between cell centres, as the shader).</summary>
+        public Vector2 GridOffset(Vector2 px)
+        {
+            if (!HasGrid || !UseGrid) return Vector2.zero;
+            float gx = px.x / ThermalCamera.Width * GridX - 0.5f, gy = px.y / ThermalCamera.Height * GridY - 0.5f;
+            int ix = Mathf.FloorToInt(gx), iy = Mathf.FloorToInt(gy);
+            float fx = gx - ix, fy = gy - iy;
+            var bottom = Vector2.Lerp(Cell(ix, iy), Cell(ix + 1, iy), fx);
+            var top = Vector2.Lerp(Cell(ix, iy + 1), Cell(ix + 1, iy + 1), fx);
+            return Vector2.Lerp(bottom, top, fy);
+        }
+
+        Vector2 Cell(int x, int y)
+        {
+            int i = Mathf.Clamp(y, 0, GridY - 1) * GridX + Mathf.Clamp(x, 0, GridX - 1);
+            return new Vector2(Grid[2 * i], Grid[2 * i + 1]);
+        }
 
         /// <summary>Thermal pixel of a point in the RGB camera frame; false behind the camera or far outside the image.</summary>
         public bool RgbToPixel(Vector3 rgb, out Vector2 px)
@@ -53,12 +110,17 @@ namespace P2Pro
             if (r2 > 1.5f) return false;
             float d = 1 + r2 * (K1 + r2 * K2);
             px = new Vector2(Cx + Fx * x * d, Cy + Fy * y * d);
+            px += GridOffset(px);
             return true;
         }
 
         /// <summary>Ray of a thermal pixel in the RGB camera frame (origin at the thermal camera).</summary>
         public Ray PixelToRgbRay(Vector2 px)
         {
+            // Undo the grid: the model pixel m with m + offset(m) = px.
+            var model = px;
+            for (int i = 0; i < 5 && GridOn; i++) model = px - GridOffset(model);
+            px = model;
             float xd = (px.x - Cx) / Fx, yd = (px.y - Cy) / Fy, x = xd, y = yd;
             for (int i = 0; i < 10; i++)
             {
@@ -78,6 +140,8 @@ namespace P2Pro
             shader.SetVector(Row2Id, r2);
             shader.SetVector(KId, k);
             shader.SetVector(DId, d);
+            shader.SetFloat(GridOnId, GridOn ? 1 : 0);
+            shader.SetVectorArray(GridId, GridUniform());
         }
 
         public void Apply(Material material)
@@ -89,6 +153,19 @@ namespace P2Pro
             material.SetVector(Row2Id, r2);
             material.SetVector(KId, k);
             material.SetVector(DId, d);
+            material.SetFloat(GridOnId, GridOn ? 1 : 0);
+            material.SetVectorArray(GridId, GridUniform());
+        }
+
+        // Two cells per vector, as P2ProThermalLens.hlsl reads them; zeros without a grid.
+        Vector4[] GridUniform()
+        {
+            if (_gridUniform != null) return _gridUniform;
+            _gridUniform = new Vector4[GridX * GridY / 2];
+            if (HasGrid)
+                for (int i = 0; i < _gridUniform.Length; i++)
+                    _gridUniform[i] = new Vector4(Grid[4 * i], Grid[4 * i + 1], Grid[4 * i + 2], Grid[4 * i + 3]);
+            return _gridUniform;
         }
 
         // RGB camera frame -> thermal camera frame as rows with the offset in w: R^T (c - P).
@@ -124,6 +201,31 @@ namespace P2Pro
         /// distances) and distortion; pairs far off the fit are dropped once. Sets
         /// <see cref="Solved"/> when the result is plausible; returns a log line.
         /// </summary>
+        /// <summary>
+        /// Nominal P2 Pro lens at the RGB camera, turned by the mount: the projection before any
+        /// calibration, and Edge align's start from scratch.
+        /// </summary>
+        public static ThermalLens Nominal(int mountDeg)
+        {
+            var n = ThermalCalibration.Nominal();
+            return new ThermalLens
+            {
+                Solved = true,
+                Rotation = Quaternion.AngleAxis(mountDeg, Vector3.forward),
+                Fx = n.Fx, Fy = n.Fy, Cx = n.Cx, Cy = n.Cy,
+                MountDeg = mountDeg,
+            };
+        }
+
+        /// <summary>Copy turned about the thermal camera's view axis to another mount roll.</summary>
+        public ThermalLens Remounted(int mountDeg)
+        {
+            var c = Clone();
+            c.Rotation = Rotation * Quaternion.AngleAxis(mountDeg - MountDeg, Vector3.forward);
+            c.MountDeg = mountDeg;
+            return c;
+        }
+
         public string Solve()
         {
             var log = new StringBuilder();
@@ -179,6 +281,8 @@ namespace P2Pro
             K1 = (float)q[10]; K2 = (float)q[11];
             RmsPx = (float)final;
             Solved = true;
+            Grid = Array.Empty<float>();        // fitted to the previous model
+            _gridUniform = null;
             if (!position) log.Append(" (position not fitted: add pairs at other distances)");
             return log.ToString();
         }

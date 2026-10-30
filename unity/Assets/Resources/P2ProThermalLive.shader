@@ -61,6 +61,8 @@ Shader "P2Pro/ThermalLive"
             float4 _RgbCrop;
             float4 _MapA;
             float4 _MapB;
+            float4x4 _WorldToRgbImage;          // world -> RGB camera when the RGB image was taken
+            float _RgbEdgesOn;
 
             struct Varyings
             {
@@ -96,6 +98,17 @@ Shader "P2Pro/ThermalLive"
                 float top = lerp(_MainTex.Load(int3(i0.x, i1.y, 0)), _MainTex.Load(int3(i1.x, i1.y, 0)), f.x);
                 return lerp(bottom, top, f.y);
             }
+            #include "Assets/Shaders/P2ProThermalEdges.hlsl"
+            #include "Assets/Shaders/P2ProRgbEdges.hlsl"
+
+            // The RGB image's texture coordinate of a world point.
+            float2 RgbImageUv(float3 world)
+            {
+                float3 c = mul(_WorldToRgbImage, float4(world, 1)).xyz;
+                if (c.z <= 0.05) return float2(-1, -1);
+                float2 sensor = c.xy / c.z * _RgbIntrinsics.xy + _RgbIntrinsics.zw;
+                return (sensor - _RgbCrop.xy) / _RgbCrop.zw;
+            }
 
             half4 frag(Varyings i) : SV_Target
             {
@@ -103,6 +116,8 @@ Shader "P2Pro/ThermalLive"
                 float3 c = mul(_WorldToRgb, float4(i.positionWS, 1)).xyz;
                 float2 uv;
                 if (!ThermalUvOf(c, _RgbIntrinsics, _RgbCrop, _MapA, _MapB, uv) || any(uv < 0) || any(uv > 1)) discard;
+                if (_Edges > 0.5)
+                    return EdgeColour(EdgeStrength(uv), _RgbEdgesOn > 0.5 ? RgbEdgeStrength(RgbImageUv(i.positionWS)) : 0, i.positionWS);
                 float celsius = Celsius(uv);
                 float k = saturate((celsius - _Min) / max(_Max - _Min, 0.01));
                 return OverlayColour(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(k, 0.5)).rgb, celsius, coverage, i.positionWS);

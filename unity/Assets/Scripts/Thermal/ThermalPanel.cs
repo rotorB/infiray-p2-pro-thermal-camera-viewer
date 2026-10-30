@@ -30,6 +30,10 @@ namespace P2Pro
         static readonly int MinId = Shader.PropertyToID("_Min");
         static readonly int MaxId = Shader.PropertyToID("_Max");
         static readonly int AlphaId = Shader.PropertyToID("_Alpha");
+        static readonly int PanelEdgesId = Shader.PropertyToID("_PanelEdges");
+        static readonly int EdgeTexId = Shader.PropertyToID("_EdgeTex");
+        static readonly int EdgeThresholdId = Shader.PropertyToID("_EdgeThreshold");
+        static readonly Color ThermalLabelColour = new(1, 0.55f, 1), RgbLabelColour = new(0.5f, 1, 1);
 
         public ThermalCamera Thermal { get; private set; }
         public ThermalFlatField FlatField { get; private set; }
@@ -59,6 +63,7 @@ namespace P2Pro
         float _overlayRoll;         // roll of the mapping on show, 0 without
         float? _thermalRoll;        // display roll asked for by the points wizard
         Transform _overlay;
+        PanelText _thermalLabel, _rgbLabel;
         Vector3 _rgbCentre;
         float _aspect;
         Texture2D[] _palettes;
@@ -103,6 +108,13 @@ namespace P2Pro
             _overlay = AddQuad("Thermal over RGB", _overlayMaterial, 0);
             _overlay.gameObject.SetActive(false);
 
+            float labelY = -PanelWidth * _aspect / 2 + 0.004f;
+            _thermalLabel = PanelText.Create(_panel, new Vector3(-PanelWidth - Gap / 2 + 0.006f, labelY, -0.001f), "Thermal label", TextAnchor.LowerLeft, 0.011f);
+            _rgbLabel = PanelText.Create(_panel, new Vector3(Gap / 2 + 0.006f, labelY, -0.001f), "RGB label", TextAnchor.LowerLeft, 0.011f);
+            _thermalLabel.Colour = ThermalLabelColour;
+            _rgbLabel.Colour = RgbLabelColour;
+            SetImageLabels("", "");
+
             var text = PanelText.Create(_panel, new Vector3(-PanelWidth - Gap / 2, -PanelWidth * _aspect / 2 - Gap, 0), "Status");
             var buttons = gameObject.AddComponent<ButtonBar>();
             buttons.Init(_panel, new Vector3(0, PanelWidth * _aspect / 2 + 0.04f, 0), 2 * PanelWidth + Gap);  // bottom row; others above
@@ -128,6 +140,27 @@ namespace P2Pro
         /// the stand-alone thermal image by the same roll; null hides the overlay.
         /// Display only: temperatures stay in the camera's own image frame.
         /// </summary>
+        /// <summary>
+        /// Edge align view: the thermal edges (steeper than <paramref name="thermalThreshold"/> °C
+        /// per pixel) magenta on the left image and <paramref name="rgbEdges"/> cyan on the right
+        /// one, both images dimmed; null turns it off.
+        /// </summary>
+        public void ShowEdges(Texture rgbEdges, float thermalThreshold)
+        {
+            bool on = rgbEdges != null;
+            _material.SetFloat(PanelEdgesId, on ? 1 : 0);
+            _material.SetFloat(EdgeThresholdId, thermalThreshold);
+            _rgbMaterial.SetFloat(PanelEdgesId, on ? 1 : 0);
+            if (on) _rgbMaterial.SetTexture(EdgeTexId, rgbEdges);
+        }
+
+        /// <summary>Captions in the lower left corner of each image: which camera, live or frozen, what is drawn.</summary>
+        public void SetImageLabels(string thermal, string rgb)
+        {
+            _thermalLabel.Text = "THERMAL CAMERA (P2 Pro)" + (thermal.Length > 0 ? "\n" + thermal : "");
+            _rgbLabel.Text = "RGB CAMERA (headset)" + (rgb.Length > 0 ? "\n" + rgb : "");
+        }
+
         public void ShowOverlay(ThermalAlignment.Mapping? m)
         {
             _overlay.gameObject.SetActive(m.HasValue);
@@ -229,8 +262,22 @@ namespace P2Pro
 
         public void NextRange() => SetRange((RangeMode)(((int)_range + 1) % RangeNames.Length));
 
-        // From a range missing in the quick order (Room) the next is the first.
-        void NextQuickRange() => SetRange(QuickRanges[(Array.IndexOf(QuickRanges, _range) + 1) % QuickRanges.Length]);
+        /// <summary>Ranges the left stick click goes through, in order.</summary>
+        public static readonly string[] QuickRangeNames = Array.ConvertAll(QuickRanges, r => RangeNames[(int)r]);
+
+        /// <summary>Panel on show (Menu button); shown again in front of the head.</summary>
+        public bool Shown => _panel != null && _panel.gameObject.activeSelf;
+
+        public void TogglePanel()
+        {
+            if (!_placed) return;
+            bool show = !Shown;
+            _panel.gameObject.SetActive(show);
+            if (show) PlaceInFrontOfHead();
+        }
+
+        // From a range missing in the quick order (Manual) the next is the first.
+        public void NextQuickRange() => SetRange(QuickRanges[(Array.IndexOf(QuickRanges, _range) + 1) % QuickRanges.Length]);
 
         /// <summary>Switches to the Manual range from <paramref name="min"/> to <paramref name="max"/> °C (remembered).</summary>
         public void SetManualRange(float min, float max)
@@ -271,14 +318,6 @@ namespace P2Pro
             if (!Frozen && rgbTexture != null && _rgbMaterial.GetTexture(MainTexId) != rgbTexture)
                 _rgbMaterial.SetTexture(MainTexId, rgbTexture);
 
-            if (_placed && OVRInput.GetDown(OVRInput.Button.Start))
-            {
-                bool show = !_panel.gameObject.activeSelf;
-                _panel.gameObject.SetActive(show);
-                if (show) PlaceInFrontOfHead();
-            }
-            if (OVRInput.GetDown(OVRInput.Button.SecondaryThumbstick)) NextPalette();
-            if (OVRInput.GetDown(OVRInput.Button.PrimaryThumbstick)) NextQuickRange();
         }
 
         void OnFrame()

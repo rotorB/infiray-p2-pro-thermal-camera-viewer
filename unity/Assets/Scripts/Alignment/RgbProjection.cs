@@ -36,7 +36,7 @@ namespace P2Pro
             var source = panel.Rgb.Source;
             if (source == null || !source.IsPlaying || panel.Thermal.FrameCount == 0) return false;
             // With only the lens model, the mapping is unused (zero).
-            if (!alignment.TryGetCoefficients(out var a, out var b) && !alignment.Lens.Solved) return false;
+            if (!alignment.TryGetCoefficients(out var a, out var b) && !alignment.Active.Solved) return false;
             a.w *= Mathf.Deg2Rad;
             b.w *= Mathf.Deg2Rad;
 
@@ -56,7 +56,7 @@ namespace P2Pro
                 Crop = new Vector4(sensor.x * (1 - crop.x) / 2, sensor.y * (1 - crop.y) / 2, sensor.x * crop.x, sensor.y * crop.y),
                 MapA = a,
                 MapB = b,
-                Lens = alignment.Lens,
+                Lens = alignment.Active,
             };
             return true;
         }

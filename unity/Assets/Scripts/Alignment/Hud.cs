@@ -6,8 +6,8 @@ namespace P2Pro
     /// <summary>
     /// Heads-up display in the lower left of the view: a few lines of what the app is doing
     /// (from <see cref="AlignMode"/>) and the palette bar with the colour range in °C. Follows the
-    /// head with a short lag so it does not shake. B on the right controller shows / hides it
-    /// (remembered between launches).
+    /// head with a short lag so it does not shake. Shown / hidden with B (<see cref="ControllerGuide"/>;
+    /// remembered between launches).
     /// </summary>
     public class Hud : MonoBehaviour
     {
@@ -69,7 +69,6 @@ namespace P2Pro
 
         void Update()
         {
-            if (OVRInput.GetDown(OVRInput.Button.Two)) Visible = !_visible;
             if (!_visible || !TryGetHead(out var head)) return;
 
             var target = new Pose(head.position + head.rotation * Offset, head.rotation);

@@ -58,12 +58,122 @@ namespace P2Pro
             public string Source;       // "manual" or "auto+manual"
         }
 
+        /// <summary>Which calibration projects the thermal image (when it exists; else the next one down).</summary>
+        public enum Kind { Mapping, Lens, Edge, EdgeGrid, Nominal }
+        public static readonly string[] KindNames = { "Mapping", "Lens (points)", "Edge", "Edge + grid", "Nominal (mount only)" };
+        const int Calibrated = 4;       // kinds made by calibrating, below Nominal
+
         public int Version = 1;
         public List<Point> Points = new();
+        /// <summary>Lens fitted to the Points wizard's pairs.</summary>
         public ThermalLens Lens = new();
+        /// <summary>Lens and correction grid fitted by Edge align.</summary>
+        public ThermalLens EdgeLens = new();
+        /// <summary>Chosen calibration (<see cref="Kind"/>).</summary>
+        public int Use = (int)Kind.EdgeGrid;
+        /// <summary>
+        /// How the thermal camera is mounted, turned about its view axis (0, 90, 180, 270): the
+        /// root of every projection. Calibrations remember the mount they were made with and are
+        /// turned by the difference, so changing it turns the thermal image at once; with no
+        /// calibration the nominal lens is turned by it.
+        /// </summary>
+        public int MountRollDeg;
+        /// <summary>Mount the mapping points were made with (their rolls include it).</summary>
+        public int MappingMountDeg;
 
-        /// <summary>Calibrated by either the mapping points or the lens model.</summary>
-        public bool Ready => Points.Count > 0 || Lens.Solved;
+        static readonly ThermalLens Off = new();
+        ThermalLens _remounted, _remountedFrom, _nominal;
+        Quaternion _remountedRotation;
+
+        /// <summary>Calibrated by the mapping points or a lens model.</summary>
+        public bool Ready => Points.Count > 0 || Lens.Solved || EdgeLens.Solved;
+
+        public bool Has(Kind kind) => kind switch
+        {
+            Kind.Mapping => Points.Count > 0,
+            Kind.Lens => Lens.Solved,
+            Kind.Edge => EdgeLens.Solved,
+            Kind.EdgeGrid => EdgeLens.Solved && EdgeLens.HasGrid,
+            _ => true,
+        };
+
+        /// <summary>
+        /// The calibration in use: the chosen one if it exists, else the best one below it, else
+        /// above; Nominal when chosen or when nothing is calibrated.
+        /// </summary>
+        public Kind Effective
+        {
+            get
+            {
+                if (Use == (int)Kind.Nominal) return Kind.Nominal;
+                int use = Mathf.Clamp(Use, 0, Calibrated - 1);
+                // An edge choice never falls back to the mapping or the points lens: the nominal lens instead.
+                int lowest = use >= (int)Kind.Edge ? (int)Kind.Edge : 0;
+                for (int k = use; k >= lowest; k--) if (Has((Kind)k)) return (Kind)k;
+                if (lowest > 0) return Kind.Nominal;
+                for (int k = use + 1; k < Calibrated; k++) if (Has((Kind)k)) return (Kind)k;
+                return Kind.Nominal;
+            }
+        }
+
+        public string EffectiveName => KindNames[(int)Effective];
+
+        /// <summary>
+        /// The lens that projects the thermal image now: the Points one, the Edge one (with or
+        /// without its grid), or an unsolved one when the mapping is used.
+        /// </summary>
+        public ThermalLens Active
+        {
+            get
+            {
+                switch (Effective)
+                {
+                    case Kind.Lens: return Remount(Lens);
+                    case Kind.Edge: EdgeLens.UseGrid = false; return Remount(EdgeLens);
+                    case Kind.EdgeGrid: EdgeLens.UseGrid = true; return Remount(EdgeLens);
+                    case Kind.Nominal:
+                        if (_nominal == null || _nominal.MountDeg != MountRollDeg) _nominal = ThermalLens.Nominal(MountRollDeg);
+                        return _nominal;
+                    default: return Off;
+                }
+            }
+        }
+
+        // The lens as made, or turned to the current mount (a copy, kept while nothing changes).
+        ThermalLens Remount(ThermalLens lens)
+        {
+            if (lens.MountDeg == MountRollDeg) return lens;
+            if (_remounted == null || _remountedFrom != lens || _remountedRotation != lens.Rotation ||
+                _remounted.MountDeg != MountRollDeg || _remounted.Fx != lens.Fx || _remounted.Grid.Length != lens.Grid.Length)
+            {
+                _remounted = lens.Remounted(MountRollDeg);
+                _remountedFrom = lens;
+                _remountedRotation = lens.Rotation;
+            }
+            _remounted.UseGrid = lens.UseGrid;
+            return _remounted;
+        }
+
+        /// <summary>Next calibration that exists, from the current choice (Nominal included).</summary>
+        public void NextKind()
+        {
+            int n = KindNames.Length;
+            for (int i = 1; i <= n; i++)
+            {
+                var k = (Kind)((Use + i) % n);
+                if (Has(k)) { Use = (int)k; return; }
+            }
+        }
+
+        /// <summary>Deletes the mapping points, the lens and the edge calibration; the mount stays.</summary>
+        public void ResetCalibrations()
+        {
+            Points.Clear();
+            Lens = new ThermalLens();
+            EdgeLens = new ThermalLens();
+            Use = (int)Kind.EdgeGrid;
+            _remounted = null;
+        }
 
         /// <summary>
         /// Thermal texture coordinate of a point in the RGB camera's frame, by the lens model or
@@ -72,9 +182,10 @@ namespace P2Pro
         public bool RgbToThermalUv(Vector3 rgb, Meta.XR.PassthroughCameraAccess source, out Vector2 uv)
         {
             uv = default;
-            if (Lens.Solved)
+            var lens = Active;
+            if (lens.Solved)
             {
-                if (!Lens.RgbToPixel(rgb, out var px)) return false;
+                if (!lens.RgbToPixel(rgb, out var px)) return false;
                 uv = new Vector2(px.x / ThermalCamera.Width, px.y / ThermalCamera.Height);
                 return true;
             }
@@ -91,13 +202,39 @@ namespace P2Pro
         {
             rgb = default;
             Ray ray;
-            if (Lens.Solved) ray = Lens.PixelToRgbRay(new Vector2(uv.x * ThermalCamera.Width, uv.y * ThermalCamera.Height));
+            var lens = Active;
+            if (lens.Solved) ray = lens.PixelToRgbRay(new Vector2(uv.x * ThermalCamera.Width, uv.y * ThermalCamera.Height));
             else if (TryEvaluate(depth, out var m))
                 ray = source.ViewportPointToRay(m.ThermalToRgb(uv), new Pose(Vector3.zero, Quaternion.identity));
             else return false;
             if (ray.direction.z < 0.05f) return false;
             rgb = ray.origin + ray.direction * ((depth - ray.origin.z) / ray.direction.z);
             return true;
+        }
+
+        /// <summary>
+        /// The calibration in use as the debug panel's overlay at a distance: the mapping itself,
+        /// or for a lens model the mapping that puts the thermal image's centre and a line across
+        /// it where the lens does (its distortion and grid are not shown). False when not calibrated.
+        /// </summary>
+        public bool TryOverlay(float distanceM, Meta.XR.PassthroughCameraAccess source, out Mapping m)
+        {
+            m = default;
+            if (!Active.Solved) return TryEvaluate(distanceM, out m);
+            var identity = new Pose(Vector3.zero, Quaternion.identity);
+            if (!View(new Vector2(0.5f, 0.5f), out var c) || !View(new Vector2(0.3f, 0.5f), out var l) ||
+                !View(new Vector2(0.7f, 0.5f), out var r)) return false;
+            var d = new Vector2(r.x - l.x, (r.y - l.y) * RgbAspect);    // RGB widths, as in Mapping
+            m = new Mapping { U = c.x, V = c.y, Scale = d.magnitude / 0.4f, RollDeg = Mathf.Atan2(d.y, d.x) * Mathf.Rad2Deg };
+            return true;
+
+            bool View(Vector2 uv, out Vector2 viewport)
+            {
+                viewport = default;
+                if (!ThermalUvToRgb(uv, distanceM, source, out var p)) return false;
+                viewport = source.WorldToViewportPoint(p, identity);
+                return true;
+            }
         }
 
         public static string FilePath => Path.Combine(Application.persistentDataPath, "thermal_alignment.json");
@@ -125,7 +262,7 @@ namespace P2Pro
             Fit(p => p.Mapping.V, out a.y, out b.y);
             Fit(p => p.Mapping.Scale, out a.z, out b.z);
             Fit(p => Mathf.DeltaAngle(roll0, p.Mapping.RollDeg), out a.w, out b.w);
-            a.w += roll0;
+            a.w += roll0 + MountRollDeg - MappingMountDeg;     // turned to the current mount
             return true;
         }
 
@@ -152,6 +289,8 @@ namespace P2Pro
 
         public void Add(float distanceM, Mapping mapping, string source)
         {
+            if (Points.Count == 0) MappingMountDeg = MountRollDeg;
+            mapping.RollDeg -= MountRollDeg - MappingMountDeg;  // stored at the mount the points were made with
             Points.Add(new Point { DistanceM = distanceM, Mapping = mapping, Source = source });
             Points.Sort((a, b) => a.DistanceM.CompareTo(b.DistanceM));
         }

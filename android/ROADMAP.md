@@ -167,6 +167,57 @@ warping a 2D image.
 - [x] Thermal flashlight (`ThermalFlashlight`): A toggles it; while on, Live, Paint and Flat
   show thermal only inside a soft-edged cone from the right controller (half-angle 3-45 deg,
   slider in the View tab). Starts off every launch.
+- [x] Edges look (X cycles surface -> wire -> edges; `P2ProThermalEdges.hlsl`): Live and Flat
+  draw only the thermal image's edges, 1 camera pixel wide (gradient ridge, non-maximum
+  suppression), steeper than a threshold (slider, °C per pixel). Lines on real outlines =
+  good alignment; step 1 of the edge-based auto alignment.
+- [x] Edge align, experimental (`EdgeAlign`, P2ProEdgeAlign.compute; Setup -> Edge align):
+  the Edges look also draws the RGB camera's edges in cyan (white where both meet). While
+  the head is still (0.3 deg / 5 mm over 0.3 s), one frame a second is collected: RGB
+  luminance edges sampled 4 x 4 per environment depth pixel (away from depth jumps) as 3D
+  points in the RGB camera frame at the thermal frame's time, and the thermal frame's edge
+  ridges (sub-pixel, nearest-edge map). Solve (background): ICP point-to-line with Huber
+  weights, gates 8 -> 1.5 px, fitting rotation, fx, fy, cx, cy, k1, k2 (position kept);
+  then a 16 x 12 grid of offsets (least squares across edge normals, smoothed) applied after
+  the lens in P2ProThermalLens.hlsl and `ThermalLens`. Scored per zone (centre / middle /
+  rim: median px across the edge, share within 1 px) against the current alignment; Apply
+  only when better, and it clears the map.
+- [x] Edge align, round 2:
+  - RGB edges at the thermal camera's pixel size (`RgbEdgeMap`, P2ProRgbEdgeMap.compute):
+    the image is averaged down by the focal length ratio before the gradient, so text and
+    pictures on a screen fade and object outlines stay; threshold slider. Depth jumps in the
+    collector use the nearest depth, so outlines in front of a far wall count.
+  - Calibrations kept side by side: mapping, lens (points), edge, edge + grid; "Using:" picks
+    the one that projects (Setup and Edge align), so each can be judged alone. The panel
+    overlay follows the one in use (`ThermalAlignment.TryOverlay`).
+  - Mount roll (0 / 90 / 180 / 270 deg), the root of every projection: each calibration keeps
+    the mount it was made with and is turned by the difference (`ThermalLens.Remounted`, the
+    mapping's roll), so changing it turns the thermal image at once. With no calibration, or
+    "Using: Nominal", the nominal lens turned by the mount projects, so Edge align can start
+    from nothing ("Reset calibrations" deletes mapping, lens and edge; the mount stays).
+  - Buttons that cannot act now are greyed and say why when pressed; every press flashes and
+    is echoed in the status and the HUD.
+  - Telemetry: still / moving, frames, last frame's points, the live fit of the calibration
+    in use per zone, result before -> after. Panel images captioned (which camera, live or
+    frozen), with thermal edges magenta and RGB edges cyan during Edge align.
+- [x] Edge align is the calibration: it beat the mapping and the points lens everywhere,
+  corners included, from one look at a TV's outline. Setup offers only Calibrate (edge),
+  Mount and Reset; the mapping and the wizard stay in code and file without buttons. An edge
+  choice falls back to the nominal lens, never to the old calibrations.
+- [x] Controller guide (`ControllerGuide`): all controller buttons in one table. A press
+  shows a toast in the middle of the view (button, what it switches, every choice with the
+  new one in brackets, or why not now); looking at a controller shows its buttons with their
+  settings above it. The panel's status starts with where it is (menu tab or calibration).
+- [x] Performance (`PerfMonitor`, Setup tab; GPU time from VrApi "App=" in logcat). Measured
+  GPU-bound, CPU ~4 ms. Fixes: URP intermediate texture Auto (was Always: a full-res copy per
+  eye, no foveation); Meta foveation via OVRManager, default high (Paint 18 -> 13 ms); room
+  scan 3 integrations / 1 mesh rebuild per second by default (was 30 / 8: Flat 72 -> 86 fps,
+  60-90 ms hitches gone); Paint reprojects the 2 newest of 4 keyframes per pixel by default
+  (4: 18.6 ms GPU, 2: 11.7, 1: 10.3), each with one hardware-filtered R16F fetch, and skips
+  triplanar axes the surface barely faces (1 keyframe: 10.3 -> 5.9 ms). At 90 Hz: Live 87,
+  Paint 86, Flat 88 fps; the rest are the scan's 3 + 1 GPU bursts a second.
+  Edge scoring only while calibrating. Switches for foveation, resolution, MSAA, display rate,
+  scan rate, paint keyframes.
 - [ ] Subtract, difference, overlay blend modes, if needed.
 
 ## Phase 4: Supervision 2 (thermal room mesh)

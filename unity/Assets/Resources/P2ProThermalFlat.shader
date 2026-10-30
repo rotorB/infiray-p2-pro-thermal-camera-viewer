@@ -81,9 +81,11 @@ Shader "P2Pro/ThermalFlat"
                 float top = lerp(_MainTex.Load(int3(i0.x, i1.y, 0)), _MainTex.Load(int3(i1.x, i1.y, 0)), f.x);
                 return lerp(bottom, top, f.y);
             }
+            #include "Assets/Shaders/P2ProThermalEdges.hlsl"
 
             half4 frag(Varyings i) : SV_Target
             {
+                if (_Edges > 0.5) return EdgeColour(EdgeStrength(i.uv), 0, i.positionWS);
                 float celsius = Celsius(i.uv);
                 float k = saturate((celsius - _Min) / max(_Max - _Min, 0.01));
                 return OverlayColour(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(k, 0.5)).rgb, celsius, 1, i.positionWS);

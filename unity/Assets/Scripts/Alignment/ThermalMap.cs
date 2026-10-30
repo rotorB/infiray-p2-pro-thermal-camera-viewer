@@ -280,7 +280,7 @@ namespace P2Pro
             if (!_visible) return;
             _style.Apply(_material);
             _keyframes.Bind(_material);
-            _alignment.Lens.Apply(_material);
+            _alignment.Active.Apply(_material);
             _panel.FlatField.Apply(_material);
             _material.SetFloat(NowId, Time.unscaledTime);
             _material.SetTexture(PaletteId, _panel.Palette);

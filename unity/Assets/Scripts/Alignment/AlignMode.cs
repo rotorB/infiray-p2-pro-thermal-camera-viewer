@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Text;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -19,15 +20,20 @@ namespace P2Pro
     /// on the thermal and the RGB image (<see cref="PointsWizard"/>); over a few frames at
     /// different distances these fit the thermal camera's lens model (<see cref="ThermalLens"/>),
     /// which then replaces the mapping for everything projected on the room.</item>
+    /// <item>Edge align (Setup tab, experimental): while the head is still, frames are collected
+    /// automatically and the lens plus a correction grid are fitted so the RGB camera's edges
+    /// (cyan) land on the thermal edges (magenta) (<see cref="EdgeAlign"/>); the room shows
+    /// Live in the Edges look meanwhile.</item>
     /// </list>
-    /// Sticks while frozen: left = move, right up / down = size, right left / right = turn,
-    /// hold a grip = fine steps. Y while viewing = next room mode (live, paint, flat); X = thermal
-    /// surfaces / thermal wireframe; B = HUD (<see cref="Hud"/>); A = thermal flashlight
-    /// (<see cref="ThermalFlashlight"/>).
+    /// Only Edge align is offered now: the mapping and the points wizard are kept but have no
+    /// buttons. Sticks while frozen: left = move, right up / down = size, right left / right =
+    /// turn, hold a grip = fine steps. Controller buttons (<see cref="ControllerGuide"/>): Y =
+    /// room mode, X = look, A = thermal flashlight, B = HUD, stick clicks = range / palette,
+    /// Menu = panel; looking at a controller shows them, a press shows the choices.
     /// </summary>
     public class AlignMode : MonoBehaviour
     {
-        enum State { View, Calibrate, Frozen, Points }
+        enum State { View, Calibrate, Frozen, Points, EdgeAlign }
         // Tabs of the View panel; stored in PlayerPrefs, append only.
         enum Tab { View, Style, Setup }
         static readonly string[] TabNames = { "View", "Style", "Setup" };
@@ -35,6 +41,7 @@ namespace P2Pro
         // Values are stored in PlayerPrefs: append new modes, do not reorder.
         enum RoomMode { Live, Paint, Off, Flat }
         static readonly string[] RoomModeNames = { "Room: live", "Room: paint + keep", "Room: off", "Flat: no 3D" };
+        static readonly string[] RoomShortNames = { "Live", "Paint", "Off", "Flat" };
         static readonly RoomMode[] RoomModeOrder = { RoomMode.Live, RoomMode.Paint, RoomMode.Flat, RoomMode.Off };
         static readonly RoomMode[] QuickRoomModes = { RoomMode.Live, RoomMode.Paint, RoomMode.Flat };   // Y
         const string RoomModeKey = "p2pro.roomMode";
@@ -66,6 +73,11 @@ namespace P2Pro
         ThermalAlignment _alignment;
         PointsWizard _wizard;
         ThermalFlashlight _flashlight;
+        EdgeAlign _edgeAlign;
+        RgbEdgeMap _rgbEdges;
+        PerfMonitor _perf;
+        RoomMode _roomModeBeforeEdges;
+        OverlayStyle.LookKind _lookBeforeEdges;
 
         State _state;
         Tab _tab;
@@ -75,6 +87,7 @@ namespace P2Pro
         float _nextRate;
         float _confirmResetUntil;
         float _confirmLensUntil;
+        float _confirmCalibrationsUntil;
         int _thermalFps, _rgbFps, _thermalFrames, _rgbFrames;
         string _note = "";
 
@@ -106,21 +119,40 @@ namespace P2Pro
             _wizard = gameObject.AddComponent<PointsWizard>();
             _wizard.Init(panel, _alignment, buttons, _probe);
             panel.SceneRange = () => _map.SceneRange;
-            gameObject.AddComponent<Hud>().Init(panel, HudText);
+            var hud = gameObject.AddComponent<Hud>();
+            hud.Init(panel, HudText);
             _flashlight = gameObject.AddComponent<ThermalFlashlight>();
+            _rgbEdges = gameObject.AddComponent<RgbEdgeMap>();
+            _rgbEdges.Init(panel, _alignment);
+            _live.RgbEdges = _rgbEdges;
+            _edgeAlign = gameObject.AddComponent<EdgeAlign>();
+            _edgeAlign.Init(panel, _alignment, _latency, () => _style.EdgeThreshold, _rgbEdges);
+            // Edge align beat the mapping and the points lens everywhere: only it is offered (the
+            // others stay in the file and the code); without it the nominal lens turned by the mount.
+            if (_alignment.Use != (int)ThermalAlignment.Kind.EdgeGrid)
+            {
+                _alignment.Use = (int)ThermalAlignment.Kind.EdgeGrid;
+                _alignment.Save();
+            }
+            BindController(hud);
+            _perf = gameObject.AddComponent<PerfMonitor>();
+            _perf.Init(() => $"{RoomShortNames[(int)_roomMode]}, look {_style.Look}, {_state}, thermal {_thermalFps} fps" +
+                             (_map.Baking ? ", baking" : "") + (_rgbEdges.Enabled ? ", RGB edges" : "") + (_flashlight.On ? ", torch" : ""));
             SetRoomMode((RoomMode)PlayerPrefs.GetInt(RoomModeKey, (int)RoomMode.Paint));
             _tab = (Tab)Mathf.Clamp(PlayerPrefs.GetInt(TabKey, 0), 0, TabNames.Length - 1);
             Debug.Log($"[P2Pro] alignment: {_alignment.Points.Count} points from {ThermalAlignment.FilePath}; lens " +
-                      (_alignment.Lens.Solved ? _alignment.Lens.ToString() : $"not solved ({_alignment.Lens.Pairs.Count} pairs)"));
+                      (_alignment.Lens.Solved ? _alignment.Lens.ToString() : $"not solved ({_alignment.Lens.Pairs.Count} pairs)") +
+                      $"; edge {(_alignment.EdgeLens.Solved ? _alignment.EdgeLens.ToString() : "none")}; using {_alignment.EffectiveName}, mount {_alignment.MountRollDeg} deg");
         }
 
         void Update()
         {
             if (_panel == null || _panel.Thermal == null) return;
             if (_state == State.Frozen) Edit();
-            if (_state == State.View && OVRInput.GetDown(OVRInput.Button.Four)) NextRoomMode(QuickRoomModes);
-            if (OVRInput.GetDown(OVRInput.Button.Three)) _style.ToggleWire();
             Probe();
+            bool edgeView = _state == State.EdgeAlign;
+            _rgbEdges.Enabled = edgeView || _style.Look == OverlayStyle.LookKind.Edges;
+            _panel.ShowEdges(edgeView ? _rgbEdges.Texture : null, _style.EdgeThreshold);
             UpdateOverlay();
             UpdateRates();
             if (Time.unscaledTime >= _nextText)
@@ -128,7 +160,30 @@ namespace P2Pro
                 _nextText = Time.unscaledTime + 0.25f;
                 _text.Text = Status();
                 ShowButtons();
+                ShowImageLabels();
             }
+        }
+
+        // Every controller button, with its current setting, for the toast and the legends.
+        void BindController(Hud hud)
+        {
+            var guide = gameObject.AddComponent<ControllerGuide>();
+            guide.Bind(OVRInput.Button.Four, true, "Y", "Room", () => RoomShortNames[(int)_roomMode],
+                () => NextRoomMode(QuickRoomModes), () => System.Array.ConvertAll(QuickRoomModes, m => RoomShortNames[(int)m]),
+                () => _state == State.View ? null : "the room stays Live during calibration (Done to leave)");
+            guide.Bind(OVRInput.Button.Three, true, "X", "Look", () => _style.Look.ToString() +
+                    (_style.Look == OverlayStyle.LookKind.Edges && _roomMode == RoomMode.Paint ? " (Live / Flat only)" : ""),
+                _style.NextLook, () => System.Enum.GetNames(typeof(OverlayStyle.LookKind)),
+                () => _state == State.EdgeAlign ? "calibration shows edges (Done to leave)" : null);
+            guide.Bind(OVRInput.Button.PrimaryThumbstick, true, "Stick click", "Range", () => _panel.RangeName,
+                _panel.NextQuickRange, () => ThermalPanel.QuickRangeNames);
+            guide.Bind(OVRInput.Button.Start, true, "Menu", "Panel", () => _panel.Shown ? "shown" : "hidden", _panel.TogglePanel);
+            guide.Bind(OVRInput.Button.One, false, "A", "Torch", () => _flashlight.On ? $"on ({_flashlight.Angle:F0} deg)" : "off",
+                _flashlight.Toggle);
+            guide.Bind(OVRInput.Button.Two, false, "B", "HUD", () => hud.Visible ? "shown" : "hidden", () => hud.Visible = !hud.Visible);
+            guide.Bind(OVRInput.Button.SecondaryThumbstick, false, "Stick click", "Palette", () => _panel.PaletteName,
+                _panel.NextPalette, () => Palettes.Names);
+            guide.Bind(OVRInput.Button.PrimaryIndexTrigger, false, "Trigger", "Point", () => "temperature; press panel buttons", null);
         }
 
         void ShowButtons()
@@ -156,7 +211,7 @@ namespace P2Pro
                             {
                                 new ButtonBar.Button(_style.BlendLabel, _style.NextBlend),
                                 new ButtonBar.Button(_style.FilterLabel, () => _style.NextFilter(_panel.RangeMin, _panel.RangeMax)),
-                                new ButtonBar.Button(_style.WireLabel, _style.ToggleWire),
+                                new ButtonBar.Button(_style.LookLabel, _style.NextLook),
                             }, new[]
                             {
                                 ButtonBar.Button.Slider(() => _style.Threshold, _style.SetThreshold,
@@ -165,16 +220,27 @@ namespace P2Pro
                                     OverlayStyle.MinOpacity, 1, v => $"Opacity {v * 100:F0}%"),
                                 ButtonBar.Button.Slider(() => _panel.Sharpening.Strength, v => _panel.Sharpening.Strength = v,
                                     0, ThermalSharpening.MaxStrength, _ => _panel.Sharpening.Label),
+                                ButtonBar.Button.Slider(() => _style.EdgeThreshold, _style.SetEdgeThreshold,
+                                    OverlayStyle.MinEdgeThreshold, OverlayStyle.MaxEdgeThreshold, v => $"Edges from {v:F1} C/px"),
                             });
                             break;
                         default:
                             _buttons.Show(TabRow(), new[]
                             {
-                                new ButtonBar.Button("Calibrate", () => SetState(State.Calibrate), !_alignment.Ready),
-                                new ButtonBar.Button("Recenter panel", _panel.PlaceInFrontOfHead),
-                                new ButtonBar.Button(_panel.FlatField.Label, ToggleFlatField),
+                                new ButtonBar.Button(_alignment.EdgeLens.Solved ? "Calibrate again" : "Calibrate",
+                                    () => SetState(State.EdgeAlign), !_alignment.EdgeLens.Solved),
+                            }.Concat(CalibrationRow()).ToArray(), new[]
+                            {
+                                new ButtonBar.Button(_perf.FoveationLabel, _perf.NextFoveation),
+                                new ButtonBar.Button(_perf.ResolutionLabel, _perf.NextResolution),
+                                new ButtonBar.Button(_perf.MsaaLabel, _perf.NextMsaa),
+                                new ButtonBar.Button(_perf.RateLabel, _perf.NextRate),
+                                new ButtonBar.Button(_perf.ScanLabel, _perf.NextScan),
+                                new ButtonBar.Button(_perf.PaintLabel, _perf.NextPaint),
                             }, new[]
                             {
+                                new ButtonBar.Button("Recenter panel", _panel.PlaceInFrontOfHead),
+                                new ButtonBar.Button(_panel.FlatField.Label, ToggleFlatField),
                                 new ButtonBar.Button(latency, ToggleLatencyMode),
                                 new ButtonBar.Button("-10 ms", () => NudgeLatency(-LatencyEstimator.StepMs)),
                                 new ButtonBar.Button("+10 ms", () => NudgeLatency(LatencyEstimator.StepMs)),
@@ -188,24 +254,28 @@ namespace P2Pro
                     _buttons.Show(new[]
                     {
                         new ButtonBar.Button("Capture", Freeze, _alignment.Points.Count == 0),
-                        new ButtonBar.Button("Undo last point", RemoveLast),
-                        new ButtonBar.Button(confirming ? "Sure? Click again" : "Reset all points", ResetAll),
+                        new ButtonBar.Button("Undo last point", RemoveLast, false, _alignment.Points.Count > 0, "no mapping points"),
+                        new ButtonBar.Button(confirming ? "Sure? Click again" : "Reset all points", ResetAll, false,
+                            _alignment.Points.Count > 0, "no mapping points"),
                         new ButtonBar.Button("Done", () => SetState(State.View)),
                     }, new[]
                     {
                         new ButtonBar.Button($"Points wizard ({_alignment.Lens.Pairs.Count})", StartPoints, _alignment.Points.Count > 0 && !_alignment.Lens.Solved),
-                        new ButtonBar.Button("Solve lens", _wizard.Solve),
-                        new ButtonBar.Button(confirmingLens ? "Sure? Click again" : "Reset lens", ResetLens),
-                    });
+                        new ButtonBar.Button("Solve lens", SolveLens, false, _alignment.Lens.Pairs.Count >= ThermalLens.MinPairs,
+                            $"needs {ThermalLens.MinPairs} point pairs, has {_alignment.Lens.Pairs.Count}: use the Points wizard"),
+                        new ButtonBar.Button(confirmingLens ? "Sure? Click again" : "Reset lens", ResetLens, false,
+                            _alignment.Lens.Solved || _alignment.Lens.Pairs.Count > 0, "no lens or pairs"),
+                    }, CalibrationRow());
                     break;
                 case State.Points:
                     _buttons.Show(new[]
                     {
                         new ButtonBar.Button("Next frame", () => SetState(State.Calibrate), _wizard.FramePairs >= 4),
-                        new ButtonBar.Button("Undo pair", _wizard.Undo),
+                        new ButtonBar.Button("Undo pair", _wizard.Undo, false, _alignment.Lens.Pairs.Count > 0, "no pairs"),
                         new ButtonBar.Button($"Turn thermal ({_wizard.Roll:F0} deg)", _wizard.Turn),
-                        new ButtonBar.Button($"Solve lens ({_alignment.Lens.Pairs.Count})", _wizard.Solve,
-                            _alignment.Lens.Pairs.Count >= ThermalLens.MinPairs),
+                        new ButtonBar.Button($"Solve lens ({_alignment.Lens.Pairs.Count})", SolveLens,
+                            _alignment.Lens.Pairs.Count >= ThermalLens.MinPairs, _alignment.Lens.Pairs.Count >= ThermalLens.MinPairs,
+                            $"needs {ThermalLens.MinPairs} pairs, has {_alignment.Lens.Pairs.Count}"),
                         new ButtonBar.Button("Done", () => SetState(State.View)),
                     });
                     break;
@@ -216,7 +286,115 @@ namespace P2Pro
                         new ButtonBar.Button("Cancel", Cancel),
                     });
                     break;
+                case State.EdgeAlign:
+                    bool enough = _edgeAlign.Frames >= EdgeAlign.MinFrames;
+                    bool canSolve = enough && !_edgeAlign.Solving;
+                    string noSolve = _edgeAlign.Solving ? "already solving, wait a few seconds"
+                        : $"needs {EdgeAlign.MinFrames} frames, has {_edgeAlign.Frames}: hold still ~1 s on different views";
+                    bool hasResult = _edgeAlign.Result != null;
+                    string noResult = _edgeAlign.Solving ? "still solving" : "no result yet: press Solve first";
+                    _buttons.Show(new[]
+                    {
+                        new ButtonBar.Button(_edgeAlign.Solving ? "Solving..." : $"Solve ({_edgeAlign.Frames}/{EdgeAlign.MinFrames}+)",
+                            () => _edgeAlign.Solve(false), canSolve && !hasResult, canSolve, noSolve),
+                        new ButtonBar.Button("Solve from scratch", () => _edgeAlign.Solve(true), false, canSolve, noSolve),
+                        new ButtonBar.Button(!hasResult ? "Apply" : _edgeAlign.Better ? "Apply (better)" : "Apply (NOT better)",
+                            ApplyEdgeAlign, hasResult && _edgeAlign.Better, hasResult, noResult),
+                        new ButtonBar.Button("Discard result", _edgeAlign.Discard, false, hasResult, noResult),
+                        new ButtonBar.Button("Clear frames", _edgeAlign.ClearFrames, false, _edgeAlign.Frames > 0, "no frames taken yet"),
+                        new ButtonBar.Button("Done", () => SetState(State.View)),
+                    }, CalibrationRow(), new[]
+                    {
+                        ButtonBar.Button.Slider(() => _style.EdgeThreshold, _style.SetEdgeThreshold,
+                            OverlayStyle.MinEdgeThreshold, OverlayStyle.MaxEdgeThreshold, v => $"Thermal edges from {v:F1} C/px"),
+                        ButtonBar.Button.Slider(() => _rgbEdges.Threshold, v => _rgbEdges.Threshold = v,
+                            RgbEdgeMap.MinThreshold, RgbEdgeMap.MaxThreshold, v => $"RGB edges from {v * 100:F0}% contrast"),
+                        ButtonBar.Button.Slider(() => _panel.Sharpening.Strength, v => _panel.Sharpening.Strength = v,
+                            0, ThermalSharpening.MaxStrength, _ => _panel.Sharpening.Label),
+                    });
+                    break;
             }
+        }
+
+        void ApplyEdgeAlign()
+        {
+            _edgeAlign.Apply();
+            _map.Clear();
+            _nextText = 0;
+        }
+
+        void SolveLens()
+        {
+            _wizard.Solve();
+            if (_alignment.Lens.Solved) _map.Clear();
+            _nextText = 0;
+        }
+
+        // How the camera is mounted, and starting the calibration over.
+        ButtonBar.Button[] CalibrationRow()
+        {
+            bool confirming = Time.unscaledTime < _confirmCalibrationsUntil;
+            return new[]
+            {
+                new ButtonBar.Button($"Mount: {_alignment.MountRollDeg} deg", NextMount),
+                new ButtonBar.Button(confirming ? "Sure? Click again" : "Reset calibrations", ResetCalibrations, false,
+                    _alignment.Ready, "nothing to reset"),
+            };
+        }
+
+        // How the thermal camera sits on the headset: turns every projection of the thermal image at once.
+        void NextMount()
+        {
+            _alignment.MountRollDeg = (_alignment.MountRollDeg + 90) % 360;
+            _alignment.Save();
+            _map.Clear();
+            _note = $"Mount {_alignment.MountRollDeg} deg: the thermal image is turned by it everywhere (room, panel, every calibration). Painted room cleared.";
+            _nextText = 0;
+            Debug.Log($"[P2Pro] mount roll {_alignment.MountRollDeg} deg");
+        }
+
+        // Mapping points, lens and edge calibration deleted (second click within a few seconds); the mount stays.
+        void ResetCalibrations()
+        {
+            if (Time.unscaledTime >= _confirmCalibrationsUntil)
+            {
+                _confirmCalibrationsUntil = Time.unscaledTime + ConfirmSeconds;
+                _nextText = 0;
+                return;
+            }
+            _confirmCalibrationsUntil = 0;
+            _alignment.ResetCalibrations();
+            _alignment.Save();
+            _map.Clear();
+            _note = $"All calibrations deleted. Using the nominal lens turned by the mount ({_alignment.MountRollDeg} deg). Edge align can start from here.";
+            _nextText = 0;
+            Debug.Log("[P2Pro] calibrations reset");
+        }
+
+        // What each image is, live or frozen, and what is drawn on it.
+        void ShowImageLabels()
+        {
+            string thermal, rgb;
+            switch (_state)
+            {
+                case State.EdgeAlign:
+                    thermal = "LIVE   magenta = thermal edges";
+                    rgb = $"LIVE   cyan = RGB edges (1/{_rgbEdges.Scale:F1} res)";
+                    break;
+                case State.Points:
+                    thermal = "FROZEN   1. mark a feature here";
+                    rgb = "FROZEN   2. then the same feature here";
+                    break;
+                case State.Frozen:
+                    thermal = "FROZEN";
+                    rgb = "FROZEN   overlay: your fit";
+                    break;
+                default:
+                    thermal = "LIVE";
+                    rgb = $"LIVE   overlay: {_alignment.EffectiveName}, mount {_alignment.MountRollDeg} deg";
+                    break;
+            }
+            _panel.SetImageLabels(thermal, rgb);
         }
 
         // Tab selector, the current tab lit; Setup asks for attention until the camera is aligned.
@@ -226,7 +404,7 @@ namespace P2Pro
             for (int i = 0; i < row.Length; i++)
             {
                 var tab = (Tab)i;
-                string label = tab == Tab.Setup && !_alignment.Ready ? "Setup: calibrate!" : TabNames[i];
+                string label = tab == Tab.Setup && !_alignment.EdgeLens.Solved ? "Setup: calibrate!" : TabNames[i];
                 row[i] = new ButtonBar.Button(_tab == tab ? $"[ {label} ]" : label, () => SetTab(tab), _tab == tab);
             }
             return row;
@@ -264,6 +442,21 @@ namespace P2Pro
         {
             if (_state is State.Frozen or State.Points && state != _state) _panel.Unfreeze();
             if (_state == State.Points && state != State.Points) _wizard.End();
+            if (_state == State.EdgeAlign && state != State.EdgeAlign)
+            {
+                _edgeAlign.End();
+                _panel.ThermalRoll = null;
+                _style.SetLook(_lookBeforeEdges);
+                SetRoomMode(_roomModeBeforeEdges);
+            }
+            if (state == State.EdgeAlign && _state != State.EdgeAlign)
+            {
+                _lookBeforeEdges = _style.Look;
+                _roomModeBeforeEdges = _roomMode;
+                _style.SetLook(OverlayStyle.LookKind.Edges);
+                SetRoomMode(RoomMode.Live);
+                _edgeAlign.Begin();
+            }
             _state = state;
             _note = "";
             _nextText = 0;
@@ -495,17 +688,26 @@ namespace P2Pro
 
         void UpdateOverlay()
         {
-            if (_state == State.Points)
+            var source = _panel.Rgb.Source;
+            if (_state == State.EdgeAlign)
+            {
+                // Images side by side with their edges; the thermal one turned as the calibration in use turns it.
+                _panel.ShowOverlay(null);
+                _panel.ThermalRoll = source != null && source.IsPlaying &&
+                    _alignment.TryOverlay(_distance > 0 ? _distance : FallbackDistance, source, out var e) ? e.RollDeg : _alignment.MountRollDeg;
+            }
+            else if (_state == State.Points)
                 _panel.ShowOverlay(null);       // both images as captured, to mark on
             else if (_state == State.Frozen)
                 _panel.ShowOverlay(_edit);
-            else if (_alignment.TryEvaluate(_distance > 0 ? _distance : FallbackDistance, out var m) && ThermalAlignment.Plausible(m))
+            else if (source != null && source.IsPlaying &&
+                     _alignment.TryOverlay(_distance > 0 ? _distance : FallbackDistance, source, out var m) && ThermalAlignment.Plausible(m))
                 _panel.ShowOverlay(m);
             else
                 _panel.ShowOverlay(_state == State.Calibrate ? DefaultMapping() : null);
         }
 
-        // Centred, sized from the nominal fields of view.
+        // Centred, sized from the nominal fields of view, turned by the mount.
         ThermalAlignment.Mapping DefaultMapping()
         {
             float scale = 0.7f;
@@ -516,7 +718,7 @@ namespace P2Pro
                     new Vector3(Mathf.Tan(ThermalHalfFovDeg * Mathf.Deg2Rad), 0, 1), new Pose(Vector3.zero, Quaternion.identity));
                 if (edge.x > 0.5f) scale = 2 * (edge.x - 0.5f);
             }
-            return new ThermalAlignment.Mapping { U = 0.5f, V = 0.5f, Scale = scale };
+            return new ThermalAlignment.Mapping { U = 0.5f, V = 0.5f, Scale = scale, RollDeg = _alignment.MountRollDeg };
         }
 
         void UpdateRates()
@@ -538,16 +740,21 @@ namespace P2Pro
             {
                 RoomMode.Live => "LIVE", RoomMode.Paint => "PAINT", RoomMode.Flat => "FLAT", _ => "OFF",
             };
-            sb.AppendLine($"{room}  {(_style.Wire ? "wire" : "surface")}  {_panel.PaletteName}  {_panel.RangeName}" +
-                          (_flashlight.On ? "  FLASHLIGHT" : ""));
+            if (_state != State.View) sb.AppendLine(Where().Substring(3));
+            sb.AppendLine($"{room}  {_style.Look.ToString().ToLowerInvariant()}  {_panel.PaletteName}  {_panel.RangeName}" +
+                          (_flashlight.On ? "  FLASHLIGHT" : "") +
+                          (_style.Look == OverlayStyle.LookKind.Edges && _roomMode == RoomMode.Paint ? "  (edges: Live / Flat only)" : ""));
             if (_state is State.Frozen or State.Points) sb.AppendLine("Thermal: frozen");
             else if (t.FrameCount == 0 || _thermalFps == 0) sb.AppendLine("Thermal: " + t.Status);
             else sb.AppendLine($"Thermal {_thermalFps} fps   min {t.Min:F1}  max {t.Max:F1}  centre {t.Center:F1} C");
             sb.AppendLine($"Distance {(_distance > 0 ? $"{_distance:F2} m" : "-")}   RGB {_rgbFps} fps");
             if (_roomMode == RoomMode.Paint)
                 sb.AppendLine($"Painted {_map.Baked} frames" + (_map.Skipped.Length > 0 ? $"  ({_map.Skipped})" : ""));
-            sb.AppendLine(_alignment.Lens.Solved ? $"Lens {_alignment.Lens.RmsPx:F1} px" : $"Mapping {_alignment.Points.Count} points");
-            sb.Append("Y mode  X wire  A flashlight  sticks palette / range  B hide");
+            string live = _edgeAlign.Live is { } z && z[0].Count > 0 ? $"   edge fit centre {z[0].MedianPx:F1} px, rim {(z[2].Count > 0 ? $"{z[2].MedianPx:F1}" : "-")} px" : "";
+            sb.AppendLine($"Calib: {_alignment.EffectiveName}, mount {_alignment.MountRollDeg} deg{live}");
+            if (_buttons.Feedback.Length > 0) sb.AppendLine(_buttons.Feedback);
+            if (_perf.Summary.Length > 0) sb.AppendLine(_perf.Summary);
+            sb.Append("Look at a controller for its buttons");
             return sb.ToString();
         }
 
@@ -559,13 +766,16 @@ namespace P2Pro
                 : t.FrameCount == 0 || _thermalFps == 0 ? t.Status
                 : $"{_thermalFps} fps, {t.Min:F1}..{t.Max:F1} C";
             string depth = _distance > 0 ? $"{_distance:F2} m" : "no depth yet";
-            sb.AppendLine($"Thermal: {thermal}    RGB: {_rgbFps} fps    Distance to centre of view: {depth}");
-            sb.AppendLine("Calibration: " + Points() + "    Menu = hide / show panel    Y = room mode    X = wire    A = flashlight    B = HUD    Point a controller anywhere = its temperature");
+            sb.AppendLine(Where());
+            sb.AppendLine($"Thermal: {thermal}    RGB: {_rgbFps} fps    Distance: {depth}    Calibration: {_alignment.EffectiveName}, mount {_alignment.MountRollDeg} deg");
+            sb.AppendLine("Look at a controller to see what its buttons do. Point anywhere = temperature there.");
+            if (_perf.Summary.Length > 0) sb.AppendLine($"Performance: {_perf.Summary}");
 
             switch (_state)
             {
                 case State.View when !_alignment.Ready:
-                    sb.AppendLine("Not calibrated yet. Open the Setup tab and press Calibrate.");
+                    sb.AppendLine($"Not calibrated: the nominal lens turned by the mount ({_alignment.MountRollDeg} deg) is used. Setup tab: set Mount until the");
+                    sb.AppendLine("thermal image stands upright, then Calibrate.");
                     break;
                 case State.View:
                     string scene = _map.SceneRange is { } r ? $"{r.x:F1}..{r.y:F1} C" : "nothing yet";
@@ -603,19 +813,52 @@ namespace P2Pro
                     sb.AppendLine("Make the coloured overlay on the right image match the RGB picture:");
                     sb.AppendLine("left stick = move, right stick up/down = size, left/right = turn, hold grip = fine.  Then Save point.");
                     break;
+                case State.EdgeAlign:
+                    EdgeAlignStatus(sb);
+                    break;
             }
             if (_note.Length > 0) sb.AppendLine(_note);
+            if (_buttons.Feedback.Length > 0) sb.AppendLine("> " + _buttons.Feedback);
             return sb.ToString();
         }
 
-        string Points()
+        // Where the panel is: which screen, and the way back.
+        string Where() => _state switch
         {
-            string lens = _alignment.Lens.Solved ? $", lens {_alignment.Lens.Used} pairs {_alignment.Lens.RmsPx:F1} px" : "";
-            if (_alignment.Points.Count == 0) return (_alignment.Lens.Solved ? "mapping none" : "none") + lens;
-            var sb = new StringBuilder();
-            sb.Append(_alignment.Points.Count).Append(_alignment.Points.Count == 1 ? " point at" : " points at");
-            foreach (var p in _alignment.Points) sb.Append($" {p.DistanceM:F2}");
-            return sb.Append(" m").Append(lens).ToString();
+            State.View => $">> MENU / {TabNames[(int)_tab].ToUpperInvariant()} tab",
+            State.EdgeAlign => ">> CALIBRATION (edges)    Done = back to the menu",
+            State.Calibrate => ">> OLD CALIBRATION (mapping)    Done = back to the menu",
+            State.Points => ">> POINTS WIZARD    Done = back to the menu",
+            _ => ">> FROZEN FRAME    Save point / Cancel",
+        };
+
+        void EdgeAlignStatus(StringBuilder sb)
+        {
+            var e = _edgeAlign;
+            sb.AppendLine("Edge align. Panel: left magenta = thermal edges, right cyan = RGB edges. Room: white where both meet.");
+            sb.AppendLine("Look at objects with warm or cold outlines (screen frame, radiator, window, door, hand) so they fall in the");
+            sb.AppendLine("centre, edges and corners of the thermal view. Hold still ~1 s per view; frames are taken by themselves.");
+            string head = e.IsStill ? "STILL, taking frames" : "MOVING, hold still";
+            string last = e.SinceCapture < 0 ? "none yet" : $"{e.SinceCapture:F0} s ago, {e.LastPoints} RGB edge points, {e.LastThermalEdges} thermal edge px";
+            sb.AppendLine($"Head: {head}    Frames {e.Frames}/40 (Solve from {EdgeAlign.MinFrames})    Last frame: {last}");
+            sb.Append($"Fit of {_alignment.EffectiveName} on the last frames (median px across edges, share < 1 px):");
+            if (e.Live == null) sb.AppendLine(" no frames yet");
+            else
+            {
+                for (int z = 0; z < 3; z++) sb.Append($"   {EdgeAlign.ZoneNames[z]} {e.Live[z]}");
+                sb.AppendLine();
+            }
+            if (e.Result != null && e.Before != null && e.After != null)
+            {
+                sb.Append(e.Better ? "RESULT is better:" : "RESULT is NOT better:");
+                for (int z = 0; z < 3; z++)
+                    sb.Append($"   {EdgeAlign.ZoneNames[z]} {Px(e.Before[z])} -> {Px(e.After[z])}");
+                sb.AppendLine("   Apply to use it, Discard to drop it.");
+            }
+            if (e.LastSolve.Length > 0) sb.AppendLine("Last solve " + e.LastSolve);
+            if (e.Note.Length > 0) sb.AppendLine(e.Note);
+
+            static string Px(EdgeAlign.Zone z) => z.Count == 0 ? "-" : $"{z.MedianPx:F1}px/{z.Within1 * 100:F0}%";
         }
     }
 }

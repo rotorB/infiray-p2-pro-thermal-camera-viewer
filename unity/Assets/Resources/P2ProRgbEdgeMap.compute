@@ -1,0 +1,53 @@
+// Edges of the headset RGB camera image at the thermal camera's pixel size, so both cameras'
+// edges are found at a similar scale (RgbEdgeMap): the image is box-averaged down by _Scale
+// (one output pixel ~ one thermal pixel), then luminance gradient ridges one output pixel
+// wide, steeper than _Threshold, are kept. Fine detail (text and pictures on a screen,
+// patterns) mostly averages away; outlines of larger objects stay.
+
+#pragma kernel Downsample
+#pragma kernel Edges
+
+Texture2D _RgbTex;
+SamplerState sampler_linear_clamp;
+RWTexture2D<float> _Luma;
+Texture2D<float> _LumaRead;
+RWTexture2D<float> _EdgeOut;
+uint2 _Size;                    // output size
+float _Threshold;               // luminance per output pixel
+
+[numthreads(8, 8, 1)]
+void Downsample(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _Size)) return;
+    // 4 x 4 bilinear taps over the output pixel's footprint: a box average.
+    float sum = 0;
+    for (int y = 0; y < 4; y++)
+    for (int x = 0; x < 4; x++)
+    {
+        float2 uv = ((float2)id.xy + (float2(x, y) + 0.5) / 4) / (float2)_Size;
+        sum += dot(_RgbTex.SampleLevel(sampler_linear_clamp, uv, 0).rgb, float3(0.299, 0.587, 0.114));
+    }
+    _Luma[id.xy] = sum / 16;
+}
+
+float L(int2 p) { return _LumaRead[clamp(p, int2(0, 0), (int2)_Size - 1)]; }
+
+float2 Gradient(int2 p) { return 0.5 * float2(L(p + int2(1, 0)) - L(p - int2(1, 0)), L(p + int2(0, 1)) - L(p - int2(0, 1))); }
+
+[numthreads(8, 8, 1)]
+void Edges(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= _Size)) return;
+    int2 p = (int2)id.xy;
+    float2 g = Gradient(p);
+    float m = length(g);
+    float e = 0;
+    if (m >= _Threshold)
+    {
+        // Neighbour across the edge, rounded to the 8 directions.
+        int2 n = (int2)round(g / m * 1.41);
+        if (m >= length(Gradient(p + n)) && m >= length(Gradient(p - n)))
+            e = smoothstep(_Threshold, 1.5 * _Threshold, m);
+    }
+    _EdgeOut[id.xy] = e;
+}

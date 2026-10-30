@@ -19,8 +19,10 @@ Shader "P2Pro/Rgb"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 
             TEXTURE2D(_MainTex); SAMPLER(sampler_MainTex);
+            TEXTURE2D(_EdgeTex); SAMPLER(sampler_EdgeTex);
             CBUFFER_START(UnityPerMaterial)
                 float4 _MainTex_ST;
+                float _PanelEdges;      // 1: the RGB edge map (Edge align) drawn cyan over the image
             CBUFFER_END
 
             struct Attributes
@@ -49,7 +51,9 @@ Shader "P2Pro/Rgb"
 
             half4 frag(Varyings i) : SV_Target
             {
-                return half4(SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, i.uv).rgb, 1);
+                half3 c = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, i.uv).rgb;
+                if (_PanelEdges > 0.5) c = lerp(c * 0.6, half3(0, 1, 1), SAMPLE_TEXTURE2D(_EdgeTex, sampler_EdgeTex, i.uv).r);
+                return half4(c, 1);
             }
             ENDHLSL
         }

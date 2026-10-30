@@ -1,0 +1,82 @@
+// Points on the headset RGB camera's edges, in 3D, for EdgeAlign: each environment depth pixel
+// is sampled 4 x 4 times; a sample whose RGB image position lies on an RGB edge at thermal
+// pixel size (RgbEdgeMap, P2ProRgbEdges.hlsl) is written with its
+// position in the RGB camera frame at the thermal frame's time, the frame the thermal lens
+// model works in. EdgeAlign then fits the lens so these points land on the thermal edges.
+// At a depth jump (an object's outline, where thermal edges are strongest) the samples take
+// the nearest depth around them: the outline belongs to the object in front.
+#include "Packages/com.genesis.roomscan/Runtime/Shaders/DepthKit.hlsl"
+#include "Assets/Shaders/P2ProRgbEdges.hlsl"
+
+#pragma kernel Collect
+
+float4x4 _WorldToRgb;           // world -> RGB camera at the thermal frame's time (lens input)
+float4x4 _WorldToRgbImage;      // world -> RGB camera when the RGB image was taken
+float4 _RgbIntrinsics;          // fx, fy, cx, cy (sensor pixels)
+float4 _RgbCrop;                // image rectangle within the sensor
+float _MaxDistance;
+uint _Capacity;
+RWStructuredBuffer<float4> _Points;     // xyz = point (lens input frame), w = edge strength
+RWStructuredBuffer<uint> _Count;
+
+#define DEPTH_EDGE 0.02
+#define SUB 4
+
+[numthreads(8, 8, 1)]
+void Collect(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= gsDepthTexSize)) return;
+    float2 texel = 1.0 / (float2)gsDepthTexSize;
+    float2 uv = ((float2)id.xy + 0.5) * texel;
+    float depth = gsDepthSample(uv);
+    if (depth <= 0.001 || depth >= 0.999) return;
+    float dL = gsDepthSample(uv - float2(texel.x, 0));
+    float dR = gsDepthSample(uv + float2(texel.x, 0));
+    float dD = gsDepthSample(uv - float2(0, texel.y));
+    float dU = gsDepthSample(uv + float2(0, texel.y));
+    bool jump = max(max(abs(depth - dL), abs(depth - dR)), max(abs(depth - dD), abs(depth - dU))) > DEPTH_EDGE;
+    if (jump)
+    {
+        // Nearest surface around: smallest linear depth among the five.
+        float best = depth, bestLinear = gsDepthNDCToLinear(depth);
+        float4 around = float4(dL, dR, dD, dU);
+        for (int k = 0; k < 4; k++)
+        {
+            float a = around[k];
+            if (a <= 0.001 || a >= 0.999) continue;
+            float l = gsDepthNDCToLinear(a);
+            if (l < bestLinear) { bestLinear = l; best = a; }
+        }
+        depth = dL = dR = dD = dU = best;
+    }
+
+    for (int sy = 0; sy < SUB; sy++)
+    for (int sx = 0; sx < SUB; sx++)
+    {
+        float2 s = ((float2(sx, sy) + 0.5) / SUB - 0.5);
+        // Depth between this pixel and its neighbours, so the samples follow the surface.
+        float d = depth + s.x * (s.x > 0 ? dR - depth : depth - dL) + s.y * (s.y > 0 ? dU - depth : depth - dD);
+        float3 world = gsDepthNDCtoWorld(float3(uv + s * texel, d));
+        float dist = distance(world, gsDepthEyePos());
+        if (dist < 0.3 || dist > _MaxDistance) continue;
+
+        float3 ci = mul(_WorldToRgbImage, float4(world, 1)).xyz;
+        if (ci.z <= 0.05) continue;
+        float2 rgbUv = ((ci.xy / ci.z * _RgbIntrinsics.xy + _RgbIntrinsics.zw) - _RgbCrop.xy) / _RgbCrop.zw;
+        if (any(rgbUv < 0.01) || any(rgbUv > 0.99)) continue;
+        float strength = RgbEdgeStrength(rgbUv);
+        if (strength < 0.5) continue;           // the ridge, not the bilinear fringe
+
+        uint i;
+        InterlockedAdd(_Count[0], 1, i);
+        if (i < _Capacity) _Points[i] = float4(mul(_WorldToRgb, float4(world, 1)).xyz, strength);
+    }
+}
+
+#pragma kernel Reset
+
+[numthreads(1, 1, 1)]
+void Reset(uint3 id : SV_DispatchThreadID)
+{
+    _Count[0] = 0;
+}

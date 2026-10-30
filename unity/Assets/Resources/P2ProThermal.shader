@@ -31,7 +31,12 @@ Shader "P2Pro/Thermal"
                 float _Min;
                 float _Max;
                 float _Alpha;
+                float _PanelEdges;      // 1: the thermal edges (Edge align) drawn magenta over the image
+                float _EdgeThreshold;
             CBUFFER_END
+
+            float Celsius(float2 uv) { return SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, uv, 0).r; }
+            #include "Assets/Shaders/P2ProThermalEdges.hlsl"
 
             struct Attributes
             {
@@ -61,7 +66,9 @@ Shader "P2Pro/Thermal"
             {
                 float celsius = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, i.uv).r;
                 float t = saturate((celsius - _Min) / max(_Max - _Min, 0.01));
-                return half4(SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(t, 0.5)).rgb, _Alpha);
+                half3 c = SAMPLE_TEXTURE2D(_Palette, sampler_Palette, float2(t, 0.5)).rgb;
+                if (_PanelEdges > 0.5) c = lerp(c * 0.6, half3(1, 0, 1), EdgeStrength(i.uv));
+                return half4(c, _Alpha);
             }
             ENDHLSL
         }

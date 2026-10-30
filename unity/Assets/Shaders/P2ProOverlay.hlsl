@@ -10,6 +10,8 @@
 // Filter: 0 = all, 1 = only above _Threshold °C, 2 = only below.
 // _Wire = 1 draws only the triangle edges, hair-thin and antialiased (each edge coloured by
 // its temperature): the coverage scales the opacity.
+// _Edges = 1 draws only edges (P2ProThermalEdges.hlsl): the thermal image's in magenta and,
+// where the shader has it, the headset RGB camera's in cyan; where both meet they add to white.
 // Flashlight (ThermalFlashlight, globals): with _FlashOn the overlay shows only inside a cone
 // from the right controller, fading out over its rim; elsewhere the room stays as it is.
 #ifndef P2PRO_OVERLAY_INCLUDED
@@ -20,6 +22,8 @@ float _Mode;
 float _Filter;
 float _Threshold;
 float _Wire;
+float _Edges;
+float _EdgeThreshold;   // °C per thermal camera pixel
 float _FlashOn;
 float3 _FlashPos;
 float3 _FlashDir;
@@ -53,20 +57,35 @@ float FlashMask(float3 world)
     return smoothstep(_FlashCos.x, _FlashCos.y, c);
 }
 
-half4 OverlayColour(half3 palette, float celsius, float coverage, float3 world)
+// colour at opacity a in the current blend mode.
+half4 BlendColour(half3 palette, half a)
 {
-    if ((_Filter > 0.5 && _Filter < 1.5 && celsius < _Threshold) || (_Filter > 1.5 && celsius > _Threshold))
-        discard;
-    float flash = FlashMask(world);
-    if (flash <= 0) discard;
     half lum = dot(palette, half3(0.299, 0.587, 0.114));
-    half a = _Alpha * coverage * flash;
     half4 c;
     if (_Mode < 0.5) c = half4(palette, a);
     else if (_Mode < 1.5) c = half4(palette * a, 0);
     else if (_Mode < 2.5) c = half4(palette * a, lum * a);
     else c = half4(0, 0, 0, (1 - lum) * a);
     return c;
+}
+
+half4 OverlayColour(half3 palette, float celsius, float coverage, float3 world)
+{
+    if ((_Filter > 0.5 && _Filter < 1.5 && celsius < _Threshold) || (_Filter > 1.5 && celsius > _Threshold))
+        discard;
+    float flash = FlashMask(world);
+    if (flash <= 0) discard;
+    return BlendColour(palette, _Alpha * coverage * flash);
+}
+
+// The Edges look: magenta where the thermal edge is, cyan where the RGB edge is, white where
+// both are, nothing elsewhere; opaque, so thin lines stay visible.
+half4 EdgeColour(float thermalEdge, float rgbEdge, float3 world)
+{
+    float a = max(thermalEdge, rgbEdge) * FlashMask(world);
+    if (a <= 0) discard;
+    half3 c = saturate(thermalEdge * half3(1, 0, 1) + rgbEdge * half3(0, 1, 1));
+    return BlendColour(c / max(max(c.r, c.g), max(c.b, 1e-3)), a);
 }
 
 #endif

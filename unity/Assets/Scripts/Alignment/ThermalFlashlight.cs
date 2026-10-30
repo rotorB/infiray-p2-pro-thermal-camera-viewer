@@ -6,7 +6,7 @@ namespace P2Pro
     /// Thermal flashlight: while on, the thermal overlays (live, painted room, flat picture) show
     /// only inside a cone from the right controller, like a torch in the dark; the rest of the
     /// room stays plain passthrough. Off, everything is as usual. A on the right controller
-    /// switches it; every launch starts off. The cone's width is remembered.
+    /// switches it (<see cref="ControllerGuide"/>); every launch starts off. The cone's width is remembered.
     /// Sets globals read by P2ProOverlay.hlsl.
     /// </summary>
     public class ThermalFlashlight : MonoBehaviour
@@ -53,7 +53,6 @@ namespace P2Pro
 
         void Update()
         {
-            if (OVRInput.GetDown(OVRInput.Button.One)) Toggle();
             if (!On) return;
             if (_trackingSpace == null)
             {

@@ -13,6 +13,9 @@ namespace P2Pro
         static readonly int PaletteId = Shader.PropertyToID("_Palette");
         static readonly int MinId = Shader.PropertyToID("_Min");
         static readonly int MaxId = Shader.PropertyToID("_Max");
+        static readonly int RgbEdgeTexId = Shader.PropertyToID("_RgbEdgeTex");
+        static readonly int WorldToRgbImageId = Shader.PropertyToID("_WorldToRgbImage");
+        static readonly int RgbEdgesOnId = Shader.PropertyToID("_RgbEdgesOn");
 
         ThermalPanel _panel;
         ThermalAlignment _alignment;
@@ -20,6 +23,9 @@ namespace P2Pro
         OverlayStyle _style;
         Material _material;
         bool _visible;
+
+        /// <summary>RGB edges for the Edges look; none without.</summary>
+        public RgbEdgeMap RgbEdges { get; set; }
 
         public bool Visible
         {
@@ -57,6 +63,22 @@ namespace P2Pro
             _material.SetTexture(PaletteId, _panel.Palette);
             _material.SetFloat(MinId, _panel.RangeMin);
             _material.SetFloat(MaxId, _panel.RangeMax);
+            // RGB edges (Edges look) where the RGB image was taken, not where the thermal one was.
+            var rgb = _panel.Rgb;
+            bool rgbEdges = RgbEdges != null && RgbEdges.Texture != null && rgb.FrameCount > 0 && !_panel.Frozen;
+            _material.SetFloat(RgbEdgesOnId, rgbEdges ? 1 : 0);
+            if (rgbEdges)
+            {
+                _material.SetTexture(RgbEdgeTexId, RgbEdges.Texture);
+                _material.SetMatrix(WorldToRgbImageId, RgbImagePose(rgb).inverse);
+            }
+        }
+
+        /// <summary>World pose (as a matrix) of the RGB camera when its latest image was taken.</summary>
+        public static Matrix4x4 RgbImagePose(HeadsetRgbCamera rgb)
+        {
+            var pose = rgb.CameraPose;          // PassthroughCameraAccess.GetCameraPose: world space
+            return Matrix4x4.TRS(pose.position, pose.rotation, Vector3.one);
         }
 
         void OnDestroy()
