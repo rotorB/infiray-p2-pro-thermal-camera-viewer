@@ -18,8 +18,9 @@ namespace P2Pro
         const string ManualKey = "p2pro.range.";
         static readonly RangeMode[] QuickRanges = { RangeMode.Scene, RangeMode.Frame, RangeMode.Wide };   // left stick
 
-        const float PanelWidth = 0.4f;
-        const float Gap = 0.02f;
+        const float PanelWidth = 0.25f;
+        const float Gap = 0.012f;
+        const float StatusLineHeight = 0.0095f;
         const float Distance = 0.7f;
         const float DropBelowEyes = 0.1f;
         const float ShowAfterSeconds = 1.5f;
@@ -66,6 +67,8 @@ namespace P2Pro
         PanelText _thermalLabel, _rgbLabel;
         Vector3 _rgbCentre;
         float _aspect;
+        PanelText _statusText;
+        UiRect _statusCard;
         Texture2D[] _palettes;
         int _palette;
         RangeMode _range = RangeMode.Scene;     // falls back to Frame until the map has data
@@ -109,15 +112,19 @@ namespace P2Pro
             _overlay.gameObject.SetActive(false);
 
             float labelY = -PanelWidth * _aspect / 2 + 0.004f;
-            _thermalLabel = PanelText.Create(_panel, new Vector3(-PanelWidth - Gap / 2 + 0.006f, labelY, -0.001f), "Thermal label", TextAnchor.LowerLeft, 0.011f);
-            _rgbLabel = PanelText.Create(_panel, new Vector3(Gap / 2 + 0.006f, labelY, -0.001f), "RGB label", TextAnchor.LowerLeft, 0.011f);
+            _thermalLabel = PanelText.Create(_panel, new Vector3(-PanelWidth - Gap / 2 + 0.006f, labelY, -0.001f), "Thermal label", TextAnchor.LowerLeft, 0.008f);
+            _rgbLabel = PanelText.Create(_panel, new Vector3(Gap / 2 + 0.006f, labelY, -0.001f), "RGB label", TextAnchor.LowerLeft, 0.008f);
             _thermalLabel.Colour = ThermalLabelColour;
             _rgbLabel.Colour = RgbLabelColour;
             SetImageLabels("", "");
 
-            var text = PanelText.Create(_panel, new Vector3(-PanelWidth - Gap / 2, -PanelWidth * _aspect / 2 - Gap, 0), "Status");
+            var text = PanelText.Create(_panel, new Vector3(-PanelWidth - Gap / 2, -PanelWidth * _aspect / 2 - Gap, 0), "Status",
+                TextAnchor.UpperLeft, StatusLineHeight);
+            _statusText = text;
+            _statusCard = UiRect.Create(_panel, "Status card", Vector3.zero, Vector2.one * 0.01f, new Color(0.06f, 0.07f, 0.09f, 0.85f), 0.012f);
+            _statusCard.SetBorder(new Color(1, 1, 1, 0.08f), 0.0008f);
             var buttons = gameObject.AddComponent<ButtonBar>();
-            buttons.Init(_panel, new Vector3(0, PanelWidth * _aspect / 2 + 0.04f, 0), 2 * PanelWidth + Gap);  // bottom row; others above
+            buttons.Init(_panel, new Vector3(0, PanelWidth * _aspect / 2 + 0.032f, 0), 2 * PanelWidth + Gap);  // bottom row; others above
             _manualMin = PlayerPrefs.GetFloat(ManualKey + "min", 15);
             _manualMax = PlayerPrefs.GetFloat(ManualKey + "max", 35);
             gameObject.AddComponent<AlignMode>().Init(this, text, buttons);
@@ -318,6 +325,14 @@ namespace P2Pro
             if (!Frozen && rgbTexture != null && _rgbMaterial.GetTexture(MainTexId) != rgbTexture)
                 _rgbMaterial.SetTexture(MainTexId, rgbTexture);
 
+            // Card behind the status text, as tall as the text.
+            float height = _statusText.Height + 0.016f;
+            float width = 2 * PanelWidth + Gap + 0.016f;
+            if (!Mathf.Approximately(_statusCard.Size.y, height))
+            {
+                _statusCard.SetSize(new Vector2(width, height));
+                _statusCard.transform.localPosition = new Vector3(0, -PanelWidth * _aspect / 2 - Gap + 0.008f - height / 2, 0.001f);
+            }
         }
 
         void OnFrame()

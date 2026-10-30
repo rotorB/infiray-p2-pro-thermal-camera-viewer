@@ -27,6 +27,9 @@ namespace P2Pro
             set { if (_text.text != value) _text.text = value; }
         }
 
+        /// <summary>Height of the current text, metres.</summary>
+        public float Height => string.IsNullOrEmpty(_text.text) ? 0 : _text.text.Split('\n').Length * LineHeight;
+
         public static PanelText Create(Transform parent, Vector3 localPosition, string name,
             TextAnchor anchor = TextAnchor.UpperLeft, float lineHeight = 0.013f)
         {

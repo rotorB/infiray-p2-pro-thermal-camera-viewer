@@ -6,7 +6,9 @@
 // (ThermalKeyframes tags, 0 = none): P2Pro/ThermalMesh averages them at full resolution.
 //
 // Bake runs per thermal frame over the environment depth pixels: each surface point is
-// splatted onto the map of its dominant normal axis; every texel of the splat is placed on the
+// splatted onto the map of its dominant normal axis, and of the second one too when the
+// surface is tilted towards it (so a rebuilt mesh triangle whose normal turned a little still
+// finds its temperature); every texel of the splat is placed on the
 // point's tangent plane and looked up in the thermal image on its own, so the map keeps the
 // thermal camera's detail and follows the surface angle. Seen texels keep a running average
 // (the first view is taken as is, later ones by weight, so a texel settles over a second or
@@ -80,6 +82,7 @@ float _Now;                             // same clock as Keyframe.info.x
 #define MIN_FACING 0.3
 #define DEPTH_EDGE 0.05
 #define MAX_SPLAT 4
+#define SECOND_AXIS_SHARE 0.45     // |n| of the second axis over the first: tan 24 deg
 
 // Thermal texture coordinate of a world point, or (-1, -1) outside the thermal image.
 float2 ThermalUv(float3 world)
@@ -296,6 +299,70 @@ void Histogram(uint3 id : SV_DispatchThreadID, uint index : SV_GroupIndex)
         if (_localUse[u] > 0) InterlockedAdd(_KeyframeUse[u], _localUse[u]);
 }
 
+// Flat field: this frame against the room's running average at this point.
+void LearnFlat(int axis, float3 world, float3 normal)
+{
+    float3 normalM = ToMap(normal, axis);
+    float3 uvwM = ToMap(gsWorldToVoxelUVW(world), axis);
+    float half0 = normalM.z > 0 ? 0.5 : 0;
+    int halfMin = (int)(half0 * _MapSize.y);
+    int2 centre = int2(uvwM.x * _MapSize.x, (uvwM.y * 0.5 + half0) * _MapSize.y);
+    if (centre.x >= 0 && centre.x < (int)_MapSize.x &&
+        centre.y >= halfMin && centre.y < halfMin + (int)(_MapSize.y / 2))
+    {
+        float4 m = ReadMap(axis, (uint2)centre);
+        float2 tuv0 = ThermalUv(world);
+        if (tuv0.x >= 0 && m.y > FLAT_MIN_CONFIDENCE && abs(m.z - uvwM.z) < 0.02)
+        {
+            float2 d = float2(2.0 / 256, 2.0 / 192);
+            float celsius = Celsius(tuv0) - FlatOffset(tuv0);
+            float gradient = max(abs(Celsius(tuv0 + float2(d.x, 0)) - Celsius(tuv0 - float2(d.x, 0))),
+                                 abs(Celsius(tuv0 + float2(0, d.y)) - Celsius(tuv0 - float2(0, d.y))));
+            if (gradient < FLAT_MAX_GRADIENT)
+            {
+                int2 cell = clamp((int2)(tuv0 * float2(FLAT_GRID_X, FLAT_GRID_Y)), 0, int2(FLAT_GRID_X - 1, FLAT_GRID_Y - 1));
+                uint i = cell.y * FLAT_GRID_X + cell.x;
+                InterlockedAdd(_FlatSum[i], (int)round(clamp(celsius - m.x, -FLAT_MAX_RESIDUAL, FLAT_MAX_RESIDUAL) * 1000));
+                InterlockedAdd(_FlatCount[i], 1u);
+            }
+        }
+    }
+}
+
+// One depth point onto one map: every texel of its footprint, placed on the point's tangent plane.
+void Splat(int axis, float3 world, float3 normal, float footprint, float quality)
+{
+    float3 extent = (float3)gsVoxCount * gsVoxSize;
+    float3 worldM = ToMap(world, axis);
+    float3 normalM = ToMap(normal, axis);
+    float3 extentM = ToMap(extent, axis);
+    float3 uvwM = ToMap(gsWorldToVoxelUVW(world), axis);
+    float2 texelSize = float2(extentM.x / _MapSize.x, extentM.y / (_MapSize.y * 0.5));
+    int radius = min(MAX_SPLAT, (int)ceil(0.5 * footprint / min(texelSize.x, texelSize.y)));
+
+    float half0 = normalM.z > 0 ? 0.5 : 0;
+    int halfMin = (int)(half0 * _MapSize.y);
+    int2 centre = int2(uvwM.x * _MapSize.x, (uvwM.y * 0.5 + half0) * _MapSize.y);
+
+    [loop] for (int dy = -radius; dy <= radius; dy++)
+    [loop] for (int dx = -radius; dx <= radius; dx++)
+    {
+        int2 t = centre + int2(dx, dy);
+        if (t.x < 0 || t.x >= (int)_MapSize.x || t.y < halfMin || t.y >= halfMin + (int)(_MapSize.y / 2)) continue;
+
+        // Texel centre on the tangent plane through the point, in map order.
+        float3 pM;
+        pM.x = ((t.x + 0.5) / _MapSize.x - 0.5) * extentM.x;
+        pM.y = (((t.y + 0.5) / _MapSize.y - half0) * 2 - 0.5) * extentM.y;
+        pM.z = worldM.z - (normalM.x * (pM.x - worldM.x) + normalM.y * (pM.y - worldM.y)) / normalM.z;
+        float3 p = FromMap(pM, axis);
+
+        float2 tuv = ThermalUv(p);
+        if (tuv.x < 0) continue;
+        Write(axis, (uint2)t, Celsius(tuv) - FlatOffset(tuv), quality, ToMap(gsWorldToVoxelUVW(p), axis).z, p, Centrality(tuv));
+    }
+}
+
 #pragma kernel Bake
 
 [numthreads(8, 8, 1)]
@@ -327,58 +394,18 @@ void Bake(uint3 id : SV_DispatchThreadID)
     // World size of this depth pixel on the surface, in map texels.
     float3 neighbour = gsDepthNDCtoWorld(float3(uv + float2(texel.x, 0), depth));
     float footprint = distance(neighbour, world) / facing;
-    float3 extent = (float3)gsVoxCount * gsVoxSize;
 
     float3 n = abs(normal);
     int axis = n.y >= n.x && n.y >= n.z ? 1 : n.z >= n.x ? 2 : 0;
-    float3 worldM = ToMap(world, axis);
-    float3 normalM = ToMap(normal, axis);
-    float3 extentM = ToMap(extent, axis);
-    float3 uvwM = ToMap(gsWorldToVoxelUVW(world), axis);
-    float2 texelSize = float2(extentM.x / _MapSize.x, extentM.y / (_MapSize.y * 0.5));
-    int radius = min(MAX_SPLAT, (int)ceil(0.5 * footprint / min(texelSize.x, texelSize.y)));
+    // The other two axes, larger first; the second map gets the point when the surface leans
+    // towards it by more than ~25 degrees.
+    int a1 = axis == 0 ? 1 : 0, a2 = axis == 2 ? 1 : 2;
+    float n1 = axis == 0 ? n.y : n.x, n2 = axis == 2 ? n.y : n.z;
+    int second = n1 >= n2 ? a1 : a2;
+    float secondShare = max(n1, n2) / max(n.x, max(n.y, n.z));
 
-    float half0 = normalM.z > 0 ? 0.5 : 0;
-    int halfMin = (int)(half0 * _MapSize.y);
-    int2 centre = int2(uvwM.x * _MapSize.x, (uvwM.y * 0.5 + half0) * _MapSize.y);
-
-    // Flat field: this frame against the room's running average at this point.
-    if (_FlatLearn > 0.5 && centre.x >= 0 && centre.x < (int)_MapSize.x &&
-        centre.y >= halfMin && centre.y < halfMin + (int)(_MapSize.y / 2))
-    {
-        float4 m = ReadMap(axis, (uint2)centre);
-        float2 tuv0 = ThermalUv(world);
-        if (tuv0.x >= 0 && m.y > FLAT_MIN_CONFIDENCE && abs(m.z - uvwM.z) < 0.02)
-        {
-            float2 d = float2(2.0 / 256, 2.0 / 192);
-            float celsius = Celsius(tuv0) - FlatOffset(tuv0);
-            float gradient = max(abs(Celsius(tuv0 + float2(d.x, 0)) - Celsius(tuv0 - float2(d.x, 0))),
-                                 abs(Celsius(tuv0 + float2(0, d.y)) - Celsius(tuv0 - float2(0, d.y))));
-            if (gradient < FLAT_MAX_GRADIENT)
-            {
-                int2 cell = clamp((int2)(tuv0 * float2(FLAT_GRID_X, FLAT_GRID_Y)), 0, int2(FLAT_GRID_X - 1, FLAT_GRID_Y - 1));
-                uint i = cell.y * FLAT_GRID_X + cell.x;
-                InterlockedAdd(_FlatSum[i], (int)round(clamp(celsius - m.x, -FLAT_MAX_RESIDUAL, FLAT_MAX_RESIDUAL) * 1000));
-                InterlockedAdd(_FlatCount[i], 1u);
-            }
-        }
-    }
-
-    [loop] for (int dy = -radius; dy <= radius; dy++)
-    [loop] for (int dx = -radius; dx <= radius; dx++)
-    {
-        int2 t = centre + int2(dx, dy);
-        if (t.x < 0 || t.x >= (int)_MapSize.x || t.y < halfMin || t.y >= halfMin + (int)(_MapSize.y / 2)) continue;
-
-        // Texel centre on the tangent plane through the point, in map order.
-        float3 pM;
-        pM.x = ((t.x + 0.5) / _MapSize.x - 0.5) * extentM.x;
-        pM.y = (((t.y + 0.5) / _MapSize.y - half0) * 2 - 0.5) * extentM.y;
-        pM.z = worldM.z - (normalM.x * (pM.x - worldM.x) + normalM.y * (pM.y - worldM.y)) / normalM.z;
-        float3 p = FromMap(pM, axis);
-
-        float2 tuv = ThermalUv(p);
-        if (tuv.x < 0) continue;
-        Write(axis, (uint2)t, Celsius(tuv) - FlatOffset(tuv), quality, ToMap(gsWorldToVoxelUVW(p), axis).z, p, Centrality(tuv));
-    }
+    if (_FlatLearn > 0.5) LearnFlat(axis, world, normal);
+    Splat(axis, world, normal, footprint, quality);
+    if (secondShare > SECOND_AXIS_SHARE) Splat(second, world, normal, footprint, quality * secondShare);
 }
+

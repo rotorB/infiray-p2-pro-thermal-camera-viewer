@@ -64,6 +64,7 @@ namespace P2Pro
         ButtonBar _buttons;
         DepthProbe _probe;
         ThermalMap _map;
+        ScanTuning _scan;
         ThermalLive _live;
         ThermalFlat _flat;
         RoomMode _roomMode;
@@ -110,6 +111,8 @@ namespace P2Pro
             _latency = gameObject.AddComponent<LatencyEstimator>();
             _latency.Init(panel, _alignment);
             _map = gameObject.AddComponent<ThermalMap>();
+            _scan = gameObject.AddComponent<ScanTuning>();
+            _scan.VolumeChanged += () => _map.Clear();
             _map.Init(panel, _alignment, _latency, _style);
             _live = gameObject.AddComponent<ThermalLive>();
             _live.Init(panel, _alignment, _latency, _style);
@@ -120,7 +123,7 @@ namespace P2Pro
             _wizard.Init(panel, _alignment, buttons, _probe);
             panel.SceneRange = () => _map.SceneRange;
             var hud = gameObject.AddComponent<Hud>();
-            hud.Init(panel, HudText);
+            hud.Init(panel, _style, HudText);
             _flashlight = gameObject.AddComponent<ThermalFlashlight>();
             _rgbEdges = gameObject.AddComponent<RgbEdgeMap>();
             _rgbEdges.Init(panel, _alignment);
@@ -214,8 +217,10 @@ namespace P2Pro
                                 new ButtonBar.Button(_style.LookLabel, _style.NextLook),
                             }, new[]
                             {
-                                ButtonBar.Button.Slider(() => _style.Threshold, _style.SetThreshold,
-                                    _panel.RangeMin, _panel.RangeMax, _ => _style.ThresholdLabel),
+                                ButtonBar.Button.Slider(() => _style.BandLow, v => _style.SetBand(v, _style.BandHigh),
+                                    _panel.RangeMin, _panel.RangeMax, v => $"Band from {v:F1} C"),
+                                ButtonBar.Button.Slider(() => _style.BandHigh, v => _style.SetBand(_style.BandLow, v),
+                                    _panel.RangeMin, _panel.RangeMax, v => $"Band to {v:F1} C"),
                                 ButtonBar.Button.Slider(() => _style.Opacity, _style.SetOpacity,
                                     OverlayStyle.MinOpacity, 1, v => $"Opacity {v * 100:F0}%"),
                                 ButtonBar.Button.Slider(() => _panel.Sharpening.Strength, v => _panel.Sharpening.Strength = v,
@@ -245,6 +250,12 @@ namespace P2Pro
                                 new ButtonBar.Button("-10 ms", () => NudgeLatency(-LatencyEstimator.StepMs)),
                                 new ButtonBar.Button("+10 ms", () => NudgeLatency(LatencyEstimator.StepMs)),
                                 new ButtonBar.Button(_panel.Thermal.AutoShutterLabel, _panel.Thermal.ToggleAutoShutter),
+                            }, new[]
+                            {
+                                ButtonBar.Button.Slider(() => _scan.VoxelCm, _scan.SetVoxelCm,
+                                    ScanTuning.MinVoxelCm, ScanTuning.MaxVoxelCm, _scan.VoxelLabel),
+                                new ButtonBar.Button(_scan.FreezeLabel, _scan.ToggleFreeze),
+                                new ButtonBar.Button("Unfreeze all", _scan.UnfreezeAll),
                             });
                             break;
                     }
@@ -733,6 +744,9 @@ namespace P2Pro
         }
 
         // A few lines for the HUD: modes, the camera's readings, how the room is painted.
+        // Rich text for the HUD card: grey labels, white values, the room mode in the accent colour.
+        const string HudLabel = "<color=#8E97A8>", HudAccent = "<color=#5AA8FF>", HudWarn = "<color=#FFC24A>", HudEnd = "</color>";
+
         string HudText()
         {
             var t = _panel.Thermal;
@@ -741,25 +755,26 @@ namespace P2Pro
             {
                 RoomMode.Live => "LIVE", RoomMode.Paint => "PAINT", RoomMode.Flat => "FLAT", _ => "OFF",
             };
-            if (_state != State.View) sb.AppendLine(Where().Substring(3));
-            sb.AppendLine($"{room}  {_style.Look.ToString().ToLowerInvariant()}  {_panel.PaletteName}  {_panel.RangeName}" +
-                          (_flashlight.On ? "  FLASHLIGHT" : "") +
-                          (_style.Look == OverlayStyle.LookKind.Edges && _roomMode == RoomMode.Paint ? "  (edges: Live / Flat only)" : ""));
-            if (_state is State.Frozen or State.Points) sb.AppendLine("Thermal: frozen");
-            else if (t.FrameCount == 0 || _thermalFps == 0 && !t.ShutterActive) sb.AppendLine("Thermal: " + t.Status);
-            else sb.AppendLine($"Thermal {_thermalFps} fps   min {t.Min:F1}  max {t.Max:F1}  centre {t.Center:F1} C" + Shutter(t));
-            sb.AppendLine($"Distance {(_distance > 0 ? $"{_distance:F2} m" : "-")}   RGB {_rgbFps} fps");
-            if (_roomMode == RoomMode.Paint)
-                sb.AppendLine($"Painted {_map.Baked} frames" + (_map.Skipped.Length > 0 ? $"  ({_map.Skipped})" : ""));
-            string live = _edgeAlign.Live is { } z && z[0].Count > 0 ? $"   edge fit centre {z[0].MedianPx:F1} px, rim {(z[2].Count > 0 ? $"{z[2].MedianPx:F1}" : "-")} px" : "";
-            sb.AppendLine($"Calib: {_alignment.EffectiveName}, mount {_alignment.MountRollDeg} deg{live}");
-            if (_buttons.Feedback.Length > 0) sb.AppendLine(_buttons.Feedback);
-            if (_perf.Summary.Length > 0) sb.AppendLine(_perf.Summary);
-            sb.Append("Look at a controller for its buttons");
-            return sb.ToString();
+            sb.AppendLine($"<b>{HudAccent}{room}{HudEnd}</b>  {_style.Look.ToString().ToLowerInvariant()}  {HudLabel}·{HudEnd}  {_panel.PaletteName}  {HudLabel}·{HudEnd}  {_panel.RangeName}" +
+                          (_flashlight.On ? $"  {HudWarn}FLASHLIGHT{HudEnd}" : ""));
+            if (_state != State.View) sb.AppendLine(HudWarn + Where().Substring(3) + HudEnd);
+            if (_style.Look == OverlayStyle.LookKind.Edges && _roomMode == RoomMode.Paint) sb.AppendLine($"{HudLabel}edges show in Live / Flat only{HudEnd}");
+            if (_state is State.Frozen or State.Points) sb.AppendLine($"{HudLabel}Thermal{HudEnd}  frozen");
+            else if (t.FrameCount == 0 || _thermalFps == 0 && !t.ShutterActive) sb.AppendLine($"{HudLabel}Thermal{HudEnd}  {t.Status}");
+            else
+            {
+                sb.AppendLine($"{HudLabel}Centre{HudEnd}  <b>{t.Center:F1}°</b>   {HudLabel}scene{HudEnd}  {t.Min:F1} – {t.Max:F1}°" +
+                              (t.ShutterActive ? $"  {HudWarn}SHUTTER{HudEnd}" : ""));
+                sb.AppendLine($"{HudLabel}Thermal{HudEnd}  {_thermalFps} fps   {HudLabel}RGB{HudEnd}  {_rgbFps} fps");
+            }
+            sb.Append($"{HudLabel}Distance{HudEnd}  {(_distance > 0 ? $"{_distance:F2} m" : "–")}");
+            if (_roomMode == RoomMode.Paint) sb.Append($"   {HudLabel}painted{HudEnd}  {_map.Baked}");
+            sb.AppendLine();
+            sb.AppendLine($"{HudLabel}Calib{HudEnd}  {_alignment.EffectiveName}, mount {_alignment.MountRollDeg}°");
+            if (_perf.Brief.Length > 0) sb.AppendLine($"{HudLabel}Perf{HudEnd}  {_perf.Brief}");
+            if (_buttons.Feedback.Length > 0) sb.AppendLine(HudWarn + _buttons.Feedback + HudEnd);
+            return sb.ToString().TrimEnd('\n', '\r');
         }
-
-        static string Shutter(ThermalCamera t) => t.ShutterActive ? "   SHUTTER" : "";
 
         string Status()
         {

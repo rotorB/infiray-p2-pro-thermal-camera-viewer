@@ -49,8 +49,8 @@ namespace P2Pro
         class Slot
         {
             public GameObject Root;
-            public MeshRenderer Background;
-            public Transform Fill, Handle;      // sliders only
+            public UiRect Background;
+            public UiRect Fill, Handle;         // sliders only
             public PanelText Text;
             public Button Button;
             public float Width;
@@ -61,17 +61,24 @@ namespace P2Pro
         OVRInput.Controller _dragController;
         float _dragMin, _dragMax;
 
-        const float Height = 0.045f;
-        const float Gap = 0.01f;
+        const float Height = 0.03f;
+        const float Gap = 0.005f;
+        const float Pad = 0.008f;               // card around the rows
+        const float TextHeight = 0.0115f;
+        const float Radius = 0.006f;
         const float RayLength = 2;
 
-        static readonly Color Normal = new(0.18f, 0.18f, 0.22f);
-        static readonly Color Accent = new(0.1f, 0.45f, 0.85f);
-        static readonly Color Hover = new(0.95f, 0.6f, 0.1f);
-        static readonly Color SliderFill = new(0.1f, 0.4f, 0.7f);
-        static readonly Color Off = new(0.1f, 0.1f, 0.11f);
-        static readonly Color Pressed = new(0.2f, 0.75f, 0.3f);
-        static readonly Color Refused = new(0.8f, 0.15f, 0.15f);
+        static readonly Color Card = new(0.06f, 0.07f, 0.09f, 0.9f);
+        static readonly Color Normal = new(0.17f, 0.18f, 0.22f, 0.95f);
+        static readonly Color Accent = new(0.16f, 0.45f, 0.9f, 1);
+        static readonly Color Hover = new(0.27f, 0.29f, 0.35f, 1);
+        static readonly Color HoverBorder = new(0.45f, 0.72f, 1, 1);
+        static readonly Color Track = new(0.12f, 0.13f, 0.16f, 0.95f);
+        static readonly Color SliderFill = new(0.16f, 0.42f, 0.82f, 0.9f);
+        static readonly Color Off = new(0.12f, 0.12f, 0.14f, 0.7f);
+        static readonly Color Pressed = new(0.2f, 0.7f, 0.35f, 1);
+        static readonly Color Refused = new(0.8f, 0.2f, 0.2f, 1);
+        static readonly Color TextOff = new(0.45f, 0.47f, 0.52f);
         const float FlashSeconds = 0.35f;
         const float FeedbackSeconds = 6;
 
@@ -88,7 +95,7 @@ namespace P2Pro
         float _width;
         readonly List<Slot> _slots = new();
         readonly Dictionary<Collider, Slot> _byCollider = new();
-        readonly Dictionary<Color, Material> _materials = new();
+        UiRect _card;
         Transform _trackingSpace;
         LineRenderer _leftRay, _rightRay;
         Material _rayMaterial;
@@ -103,7 +110,10 @@ namespace P2Pro
             _root.SetParent(parent, false);
             _root.localPosition = localPosition;
             _width = width;
-            _rayMaterial = ColourMaterial(Color.white);
+            _card = UiRect.Create(_root, "Menu card", Vector3.zero, Vector2.one * 0.01f, Card, 0.014f);
+            _card.SetBorder(new Color(1, 1, 1, 0.08f), 0.0008f);
+            _card.Order = -1;
+            _rayMaterial = new Material(Resources.Load<Shader>("P2ProRgb")) { mainTexture = Texture2D.whiteTexture };
             _leftRay = CreateRay("Left pointer");
             _rightRay = CreateRay("Right pointer");
         }
@@ -125,7 +135,7 @@ namespace P2Pro
                     slot.Button = row[i];
                     slot.Width = w;
                     slot.Root.transform.localPosition = new Vector3(-_width / 2 + w / 2 + i * (w + Gap), (rows.Length - 1 - r) * (Height + Gap), 0);
-                    slot.Background.transform.localScale = new Vector3(w, Height, 1);
+                    slot.Background.SetSize(new Vector2(w, Height));
                     slot.Fill.gameObject.SetActive(row[i].IsSlider);
                     slot.Handle.gameObject.SetActive(row[i].IsSlider);
                     if (row[i].IsSlider) UpdateSlider(slot);
@@ -133,6 +143,9 @@ namespace P2Pro
                 }
             }
             for (int i = next; i < _slots.Count; i++) _slots[i].Root.SetActive(false);
+            float height = rows.Length * Height + (rows.Length - 1) * Gap + 2 * Pad;
+            _card.SetSize(new Vector2(_width + 2 * Pad, height));
+            _card.transform.localPosition = new Vector3(0, height / 2 - Height / 2 - Pad, 0.001f);
             if (_drag != null && (!_drag.Root.activeSelf || !_drag.Button.IsSlider)) _drag = null;
         }
 
@@ -144,10 +157,10 @@ namespace P2Pro
             float f = Mathf.InverseLerp(b.Min, b.Max, value);
             if (slot == _drag) f = Mathf.InverseLerp(_dragMin, _dragMax, value);
             float w = slot.Width;
-            slot.Fill.localPosition = new Vector3(-w / 2 + w * f / 2, 0, -0.0005f);
-            slot.Fill.localScale = new Vector3(Mathf.Max(w * f, 0.0001f), Height, 1);
-            slot.Handle.localPosition = new Vector3(-w / 2 + w * f, 0, -0.0007f);
-            slot.Handle.localScale = new Vector3(0.004f, Height, 1);
+            float fill = Mathf.Max(w * f, 2 * Radius);      // keeps the rounded end
+            slot.Fill.transform.localPosition = new Vector3(-w / 2 + fill / 2, 0, -0.0005f);
+            slot.Fill.SetSize(new Vector2(fill, Height));
+            slot.Handle.transform.localPosition = new Vector3(Mathf.Clamp(-w / 2 + w * f, -w / 2 + 0.004f, w / 2 - 0.004f), 0, -0.0007f);
             slot.Text.Text = b.Format(value);
         }
 
@@ -155,50 +168,30 @@ namespace P2Pro
         {
             var root = new GameObject("Button");
             root.transform.SetParent(_root, false);
-            var quad = GameObject.CreatePrimitive(PrimitiveType.Quad);   // keeps its MeshCollider for the pointer
-            quad.transform.SetParent(root.transform, false);
             var slot = new Slot
             {
                 Root = root,
-                Background = quad.GetComponent<MeshRenderer>(),
-                Text = PanelText.Create(root.transform, new Vector3(0, 0, -0.001f), "Label", TextAnchor.MiddleCenter, 0.016f),
-                Fill = Bar(root.transform, "Fill", SliderFill),
-                Handle = Bar(root.transform, "Handle", Color.white),
+                Background = UiRect.Create(root.transform, "Background", Vector3.zero, new Vector2(0.1f, Height), Normal, Radius, collider: true),
+                Text = PanelText.Create(root.transform, new Vector3(0, 0, -0.001f), "Label", TextAnchor.MiddleCenter, TextHeight),
+                Fill = UiRect.Create(root.transform, "Fill", Vector3.zero, new Vector2(0.01f, Height), SliderFill, Radius),
+                Handle = UiRect.Create(root.transform, "Handle", Vector3.zero, new Vector2(0.003f, Height * 0.6f), Color.white, 0.0015f),
             };
-            _byCollider[quad.GetComponent<Collider>()] = slot;
+            slot.Fill.Order = 1;
+            slot.Handle.Order = 2;
+            slot.Fill.gameObject.SetActive(false);
+            slot.Handle.gameObject.SetActive(false);
+            _byCollider[slot.Background.Collider] = slot;
             return slot;
-        }
-
-        Transform Bar(Transform parent, string name, Color colour)
-        {
-            var quad = GameObject.CreatePrimitive(PrimitiveType.Quad);
-            quad.name = name;
-            Destroy(quad.GetComponent<Collider>());
-            quad.GetComponent<MeshRenderer>().sharedMaterial = ColourMaterial(colour);
-            quad.transform.SetParent(parent, false);
-            quad.SetActive(false);
-            return quad.transform;
         }
 
         LineRenderer CreateRay(string name)
         {
             var line = new GameObject(name).AddComponent<LineRenderer>();
             line.sharedMaterial = _rayMaterial;
-            line.widthMultiplier = 0.002f;
+            line.widthMultiplier = 0.0015f;
             line.positionCount = 2;
             line.useWorldSpace = true;
             return line;
-        }
-
-        Material ColourMaterial(Color colour)
-        {
-            if (_materials.TryGetValue(colour, out var material)) return material;
-            var texture = new Texture2D(1, 1);
-            texture.SetPixel(0, 0, colour);
-            texture.Apply();
-            material = new Material(Resources.Load<Shader>("P2ProRgb")) { mainTexture = texture };
-            _materials[colour] = material;
-            return material;
         }
 
         void Update()
@@ -217,12 +210,15 @@ namespace P2Pro
             foreach (var slot in _slots)
             {
                 bool enabled = slot.Button.Enabled || slot.Button.IsSlider;
+                bool hover = slot == hovered || slot == _drag;
                 var colour = slot == _flash && Time.unscaledTime < _flashUntil ? (_flashOk ? Pressed : Refused)
-                    : slot == hovered || slot == _drag ? Hover
+                    : slot.Button.IsSlider ? Track
+                    : hover ? (slot.Button.Highlight ? Color.Lerp(Accent, Color.white, 0.15f) : Hover)
                     : !enabled ? Off
                     : slot.Button.Highlight ? Accent : Normal;
-                slot.Background.sharedMaterial = ColourMaterial(colour);
-                slot.Text.Colour = enabled ? Color.white : new Color(0.45f, 0.45f, 0.45f);
+                slot.Background.Colour = colour;
+                slot.Background.SetBorder(hover ? HoverBorder : Color.clear, 0.0012f);
+                slot.Text.Colour = enabled ? Color.white : TextOff;
                 if (slot.Root.activeSelf && slot.Button.IsSlider) UpdateSlider(slot);
             }
         }
@@ -289,7 +285,7 @@ namespace P2Pro
         // The held slider takes the value where the ray crosses it (clamped to its ends).
         void Drag(Ray ray)
         {
-            var background = _drag.Background.transform;
+            var background = _drag.Background.transform;   // its scale is its size: x runs -0.5 .. 0.5
             if (!new Plane(background.forward, background.position).Raycast(ray, out float d)) return;
             float x = background.InverseTransformPoint(ray.GetPoint(d)).x;
             _drag.Button.Set(Mathf.Lerp(_dragMin, _dragMax, Mathf.Clamp01(x + 0.5f)));
@@ -299,11 +295,7 @@ namespace P2Pro
         {
             if (_leftRay != null) Destroy(_leftRay.gameObject);
             if (_rightRay != null) Destroy(_rightRay.gameObject);
-            foreach (var m in _materials.Values)
-            {
-                Destroy(m.mainTexture);
-                Destroy(m);
-            }
+            Destroy(_rayMaterial);
         }
     }
 }

@@ -45,6 +45,23 @@ namespace Genesis.RoomScan
         [Tooltip("Min voxel confidence weight for Surface Nets to generate mesh. Higher = fewer phantom surfaces. (default 0.08)")]
         [SerializeField, Range(0.01f, 0.5f)] private float minMeshWeight = 0.08f;
         public float MinMeshWeight => minMeshWeight;
+        /// <summary>Weight a voxel converges to with enough views.</summary>
+        public float MaxWeight => maxWeight;
+
+        /// <summary>
+        /// Changes the voxel size, keeping <see cref="VoxelCount"/>: the volume covers
+        /// count x size around the world origin. The scan starts over (volumes re-allocated
+        /// and cleared). P2Pro patch.
+        /// </summary>
+        public void SetVoxelSize(float size)
+        {
+            if (Mathf.Approximately(size, voxelSize)) return;
+            bool allocated = _volume != null;
+            if (allocated) ReleaseVolumes();
+            voxelSize = size;
+            if (allocated) ReallocateVolumes();
+            Logger.Info($"Voxel size {voxelSize * 100:F1} cm, volume {new Vector3(voxelCount.x, voxelCount.y, voxelCount.z) * voxelSize} m");
+        }
 
         [Header("Camera Color")]
         [Tooltip("Exposure boost for camera texture. Quest 3 passthrough cameras produce dim images. (default 3.0)")]
@@ -270,6 +287,7 @@ namespace Genesis.RoomScan
         private static readonly int FillMaxFacesID = Shader.PropertyToID("gsFillMaxFaces");
         private static readonly int FreezeOriginID = Shader.PropertyToID("gsFreezeOrigin");
         private static readonly int FreezeDirID = Shader.PropertyToID("gsFreezeDir");
+        private static readonly int FreezeMinWeightID = Shader.PropertyToID("gsFreezeMinWeight");
 
         enum AnalysisState { Idle, FineFlood, LeakFaces, Link, Classify, Finalize, Readback, Disabled }
 
@@ -1117,6 +1135,13 @@ namespace Genesis.RoomScan
         /// <paramref name="maxMetres"/> 0 is unbounded.
         /// </summary>
         public void FreezeInView(Vector3 origin, Vector3 direction, float halfAngleDegrees, float maxMetres = 0f)
+            => FreezeInView(origin, direction, halfAngleDegrees, maxMetres, 0f);
+
+        /// <summary>
+        /// Freeze only the voxels in the cone whose weight reached <paramref name="minWeight"/>:
+        /// surfaces seen often enough stop changing, the rest keeps integrating. P2Pro patch.
+        /// </summary>
+        public void FreezeInView(Vector3 origin, Vector3 direction, float halfAngleDegrees, float maxMetres, float minWeight)
         {
             if (_volume == null || _freezeKernel.Shader == null)
             {
@@ -1124,10 +1149,22 @@ namespace Genesis.RoomScan
                 return;
             }
             SetFreezeCone(origin, direction, halfAngleDegrees, maxMetres);
+            compute.SetFloat(FreezeMinWeightID, minWeight);
             BindExclusionUniforms(compute);
             _freezeKernel.Set(VolumeRWID, _volume);
             _freezeKernel.DispatchFit(_volume);
-            Logger.Info($"FreezeInView dispatched (cone ±{halfAngleDegrees:F0}° max={maxMetres:F2}m)");
+            Logger.Verbose($"FreezeInView dispatched (cone ±{halfAngleDegrees:F0}° max={maxMetres:F2}m, weight >= {minWeight:F2})");
+        }
+
+        /// <summary>Unfreezes every frozen voxel. P2Pro patch.</summary>
+        public void UnfreezeAll()
+        {
+            if (_volume == null || _unfreezeKernel.Shader == null) return;
+            compute.SetVector(FreezeOriginID, new Vector4(0, 0, 0, -1));     // cos(180°): every direction
+            compute.SetVector(FreezeDirID, new Vector4(0, 0, 1, 0));
+            _unfreezeKernel.Set(VolumeRWID, _volume);
+            _unfreezeKernel.DispatchFit(_volume);
+            Logger.Info("UnfreezeAll dispatched");
         }
 
         /// <summary>Unfreeze frozen voxels inside the default head cone.</summary>

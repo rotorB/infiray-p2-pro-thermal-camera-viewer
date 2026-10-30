@@ -45,6 +45,8 @@ namespace P2Pro
 
         /// <summary>Last 2 s, one line; empty until the first.</summary>
         public string Summary { get; private set; } = "";
+        /// <summary>Frame rate and GPU time only, for the HUD.</summary>
+        public string Brief { get; private set; } = "";
         public string FoveationLabel => "Foveation: " + FoveationNames[_foveation];
         public string ResolutionLabel => $"Resolution {Resolutions[_resolution] * 100:F0}%";
         public string MsaaLabel => MsaaSamples[_msaa] == 1 ? "MSAA off" : $"MSAA {MsaaSamples[_msaa]}x";
@@ -179,6 +181,7 @@ namespace P2Pro
                 ? $"CPU {_cpu / _timed:F1} ms, render {_render / _timed:F1} ms, GPU {_gpu / _timed:F1} ms"
                 : "no frame timings";
             Summary = $"{fps:F0}/{Rate:F0} fps, worst {_worstMs:F0} ms, {times}";
+            Brief = $"{fps:F0}/{Rate:F0} fps" + (_timed > 0 ? $", GPU {_gpu / _timed:F1} ms" : "");
             Debug.Log($"[P2Pro] perf: {Summary}; {FoveationLabel}, {ResolutionLabel}, {MsaaLabel}, {ScanLabel}, {PaintLabel}; {_context?.Invoke()}");
             _frames = _timed = 0;
             _cpu = _render = _gpu = _worstMs = 0;

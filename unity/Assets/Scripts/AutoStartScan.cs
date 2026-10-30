@@ -10,8 +10,9 @@ namespace P2Pro
     /// also asks for the USE_SCENE, HEADSET_CAMERA and USE_ANCHOR_API permissions.
     /// The scan volume is a fixed box around Unity's world origin (19.2 x 6.4 x 19.2 m, see
     /// VolumeIntegrator.voxelCount), and the world origin is wherever the headset's tracking
-    /// started, possibly another room. So before scanning, the world is shifted horizontally
-    /// to put the head at the volume's centre.
+    /// started, possibly another room. So before scanning, the world is shifted to put the head
+    /// at the volume's centre horizontally, and the floor <see cref="VolumeCentreHeight"/>
+    /// below it, so the walls fit even with small voxels (ScanTuning).
     /// Quest's depth service sometimes refuses the app's depth provider (system log
     /// "EnvironmentDepth ... Failed to create layer"), and Unity starts it only once; while no
     /// depth arrives the capture is restarted every few seconds. The boundary is suppressed.
@@ -29,6 +30,8 @@ namespace P2Pro
             new GameObject(nameof(AutoStartScan)).AddComponent<AutoStartScan>();
         }
 
+        /// <summary>Height of the scan volume's centre above the floor, m.</summary>
+        public const float VolumeCentreHeight = 1.3f;
         const float TrackingWaitSeconds = 5;
         const float DepthRetrySeconds = 6;
 
@@ -76,7 +79,8 @@ namespace P2Pro
             depth.StartDepthCapture();
         }
 
-        // Moves the tracking space so the head is at x = z = 0. MRUK's world lock, when active,
+        // Moves the tracking space so the head is at x = z = 0 and the floor (the tracking
+        // origin is floor level) at y = -VolumeCentreHeight. MRUK's world lock, when active,
         // owns the TrackingSpace pose and applies TrackingSpaceOffset; otherwise the rig root
         // moves it. The offset is set in both cases in case world lock starts later.
         static async Awaitable CentreWorldOnHead()
@@ -94,7 +98,7 @@ namespace P2Pro
                 return;
             }
             var head = rig.centerEyeAnchor.position;
-            var shift = new Vector3(-head.x, 0, -head.z);
+            var shift = new Vector3(-head.x, -VolumeCentreHeight, -head.z);
             var mruk = MRUK.Instance;
             bool worldLock = mruk != null && mruk.IsWorldLockActive;
             if (mruk != null) mruk.TrackingSpaceOffset = Matrix4x4.Translate(shift) * mruk.TrackingSpaceOffset;

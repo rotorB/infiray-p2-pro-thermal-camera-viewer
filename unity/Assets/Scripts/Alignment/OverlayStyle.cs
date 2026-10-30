@@ -5,15 +5,15 @@ namespace P2Pro
 {
     /// <summary>
     /// How the thermal overlay on the room mesh is blended with the room (P2ProOverlay.hlsl):
-    /// blend mode, opacity (slider), a hot-only / cold-only temperature filter with its threshold
-    /// (slider) and the look: surfaces, wireframe edges, or the thermal image's edges as lines
+    /// blend mode, opacity (slider), a temperature band (two handles on the HUD's palette bar)
+    /// coloured alone or left out, and the look: surfaces, wireframe edges, or the thermal image's edges as lines
     /// (to check the alignment against real outlines; Live and Flat). Remembered between
     /// launches, except the look: every launch starts on surfaces.
     /// </summary>
     public class OverlayStyle
     {
         public enum BlendKind { Alpha, Add, Screen, Multiply }
-        public enum FilterKind { All, Hot, Cold }
+        public enum FilterKind { All, Inside, Outside }
         public enum LookKind { Surface, Wire, Edges }
         public const float MinEdgeThreshold = 0.1f, MaxEdgeThreshold = 5;
 
@@ -22,6 +22,9 @@ namespace P2Pro
         static readonly int ModeId = Shader.PropertyToID("_Mode");
         static readonly int FilterId = Shader.PropertyToID("_Filter");
         static readonly int ThresholdId = Shader.PropertyToID("_Threshold");
+        static readonly int ThresholdHighId = Shader.PropertyToID("_ThresholdHigh");
+        /// <summary>Narrowest band, °C.</summary>
+        public const float MinBand = 0.2f;
         static readonly int WireId = Shader.PropertyToID("_Wire");
         static readonly int EdgesId = Shader.PropertyToID("_Edges");
         static readonly int EdgeThresholdId = Shader.PropertyToID("_EdgeThreshold");
@@ -34,22 +37,25 @@ namespace P2Pro
         public BlendKind Blend { get; private set; }
         public float Opacity { get; private set; }
         public FilterKind Filter { get; private set; }
-        public float Threshold { get; private set; }
+        /// <summary>The band: coloured alone (Inside) or left out (Outside), °C.</summary>
+        public float BandLow { get; private set; }
+        public float BandHigh { get; private set; }
         public LookKind Look { get; private set; }
         /// <summary>Draws only the mesh's triangle edges, each coloured by its temperature.</summary>
         public bool Wire => Look == LookKind.Wire;
         /// <summary>Draws only the thermal image's edges, steeper than this many °C per camera pixel.</summary>
         public float EdgeThreshold { get; private set; }
 
-        bool _thresholdSet;
+        bool _bandSet;
 
         public OverlayStyle()
         {
             Blend = (BlendKind)PlayerPrefs.GetInt(Key + "blend", 0);
             Opacity = Mathf.Clamp(PlayerPrefs.GetFloat(Key + "opacityValue", 0.75f), MinOpacity, 1);
-            Filter = (FilterKind)PlayerPrefs.GetInt(Key + "filter", 0);
-            Threshold = PlayerPrefs.GetFloat(Key + "threshold", 30);
-            _thresholdSet = PlayerPrefs.HasKey(Key + "threshold");
+            Filter = (FilterKind)Mathf.Clamp(PlayerPrefs.GetInt(Key + "band", 0), 0, 2);    // was "filter": hot / cold
+            BandLow = PlayerPrefs.GetFloat(Key + "bandLow", 20);
+            BandHigh = Mathf.Max(PlayerPrefs.GetFloat(Key + "bandHigh", 30), BandLow + MinBand);
+            _bandSet = PlayerPrefs.HasKey(Key + "bandLow");
             EdgeThreshold = Mathf.Clamp(PlayerPrefs.GetFloat(Key + "edgeThreshold", 0.8f), MinEdgeThreshold, MaxEdgeThreshold);
         }
 
@@ -65,41 +71,34 @@ namespace P2Pro
             Save();
         }
 
-        /// <summary>All -> hot -> cold. The first time, the threshold starts at 3/4 of the range.</summary>
-        public void NextFilter(float rangeMin, float rangeMax)
+        /// <summary>All -> inside -> outside. The first time, the band starts on the middle half of the range.</summary>
+        public void NextFilter(float rangeMin, float rangeMax) => SetFilter((FilterKind)(((int)Filter + 1) % 3), rangeMin, rangeMax);
+
+        public void SetFilter(FilterKind filter, float rangeMin, float rangeMax)
         {
-            Filter = (FilterKind)(((int)Filter + 1) % 3);
-            if (!_thresholdSet && Filter != FilterKind.All)
-            {
-                Threshold = Mathf.Round(rangeMin + 0.75f * (rangeMax - rangeMin));
-                _thresholdSet = true;
-            }
+            Filter = filter;
+            if (!_bandSet && Filter != FilterKind.All)
+                SetBand(rangeMin + 0.25f * (rangeMax - rangeMin), rangeMin + 0.75f * (rangeMax - rangeMin));
             Save();
         }
 
-        /// <summary>Sets the threshold; with the filter off, it turns to hot-only so the change shows.</summary>
-        public void SetThreshold(float celsius)
+        /// <summary>Sets the band; with the filter off, it turns to inside-only so the change shows.</summary>
+        public void SetBand(float low, float high)
         {
-            Threshold = celsius;
-            _thresholdSet = true;
-            if (Filter == FilterKind.All) Filter = FilterKind.Hot;
+            BandLow = Mathf.Min(low, high - MinBand);
+            BandHigh = Mathf.Max(high, BandLow + MinBand);
+            _bandSet = true;
+            if (Filter == FilterKind.All) Filter = FilterKind.Inside;
             Save();
         }
-
-        public string ThresholdLabel => Filter switch
-        {
-            FilterKind.Cold => $"Threshold: below {Threshold:F1} C",
-            FilterKind.Hot => $"Threshold: above {Threshold:F1} C",
-            _ => $"Threshold {Threshold:F1} C (drag = hot only)",
-        };
 
         public string BlendLabel => "Blend: " + Blend.ToString().ToLowerInvariant();
         public string LookLabel => "Look: " + Look.ToString().ToLowerInvariant();
         public string FilterLabel => Filter switch
         {
-            FilterKind.Hot => $"Show: > {Threshold:F0} C",
-            FilterKind.Cold => $"Show: < {Threshold:F0} C",
-            _ => "Show: all",
+            FilterKind.Inside => $"Colour: {BandLow:F1}..{BandHigh:F1} C only",
+            FilterKind.Outside => $"Colour: all but {BandLow:F1}..{BandHigh:F1} C",
+            _ => "Colour: all",
         };
 
         public void Apply(Material material)
@@ -107,7 +106,8 @@ namespace P2Pro
             material.SetFloat(AlphaId, Opacity);
             material.SetFloat(ModeId, (float)Blend);
             material.SetFloat(FilterId, (float)Filter);
-            material.SetFloat(ThresholdId, Threshold);
+            material.SetFloat(ThresholdId, BandLow);
+            material.SetFloat(ThresholdHighId, BandHigh);
             material.SetFloat(WireId, Wire ? 1 : 0);
             material.SetFloat(EdgesId, Look == LookKind.Edges ? 1 : 0);
             material.SetFloat(EdgeThresholdId, EdgeThreshold);
@@ -127,8 +127,9 @@ namespace P2Pro
         {
             PlayerPrefs.SetInt(Key + "blend", (int)Blend);
             PlayerPrefs.SetFloat(Key + "opacityValue", Opacity);
-            PlayerPrefs.SetInt(Key + "filter", (int)Filter);
-            PlayerPrefs.SetFloat(Key + "threshold", Threshold);
+            PlayerPrefs.SetInt(Key + "band", (int)Filter);
+            PlayerPrefs.SetFloat(Key + "bandLow", BandLow);
+            PlayerPrefs.SetFloat(Key + "bandHigh", BandHigh);
             PlayerPrefs.SetFloat(Key + "edgeThreshold", EdgeThreshold);
             PlayerPrefs.Save();
         }

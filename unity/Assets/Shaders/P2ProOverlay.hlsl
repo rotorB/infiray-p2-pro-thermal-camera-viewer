@@ -7,7 +7,7 @@
 //   add      (palette * a, 0)        -> palette added to the room
 //   screen   (palette * a, lum * a)  -> screen, by the palette's brightness
 //   multiply (0, (1 - lum) * a)      -> room darkened where the palette is dark
-// Filter: 0 = all, 1 = only above _Threshold °C, 2 = only below.
+// Filter: 0 = all, 1 = only inside the band _Threshold .. _ThresholdHigh °C, 2 = only outside it.
 // _Wire = 1 draws only the triangle edges, hair-thin and antialiased (each edge coloured by
 // its temperature): the coverage scales the opacity.
 // _Edges = 1 draws only edges (P2ProThermalEdges.hlsl): the thermal image's in magenta and,
@@ -21,6 +21,7 @@ float _Alpha;
 float _Mode;
 float _Filter;
 float _Threshold;
+float _ThresholdHigh;
 float _Wire;
 float _Edges;
 float _EdgeThreshold;   // °C per thermal camera pixel
@@ -71,7 +72,8 @@ half4 BlendColour(half3 palette, half a)
 
 half4 OverlayColour(half3 palette, float celsius, float coverage, float3 world)
 {
-    if ((_Filter > 0.5 && _Filter < 1.5 && celsius < _Threshold) || (_Filter > 1.5 && celsius > _Threshold))
+    bool inside = celsius >= _Threshold && celsius <= _ThresholdHigh;
+    if ((_Filter > 0.5 && _Filter < 1.5 && !inside) || (_Filter > 1.5 && inside))
         discard;
     float flash = FlashMask(world);
     if (flash <= 0) discard;

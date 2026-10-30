@@ -245,6 +245,7 @@ void StampScreen(uint3 id : SV_DispatchThreadID)
 // the length (metres); 0 is unbounded.
 float4 gsFreezeOrigin;   // xyz apex, w = cos(half angle)
 float4 gsFreezeDir;      // xyz unit axis, w = max metres (0 = unbounded)
+float gsFreezeMinWeight; // freeze only voxels this confident (P2Pro patch; 0 = any)
 
 bool gsInFreezeCone(float3 worldPos)
 {
@@ -261,7 +262,7 @@ void FreezeInFrustum(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= gsVoxCount)) return;
     float2 vol = gsVolumeRW[id];
-    if (vol.y <= 0) return; // empty or already frozen
+    if (vol.y <= 0 || vol.y < gsFreezeMinWeight) return; // empty, already frozen, or not seen enough
 
     float3 worldPos = gsVoxelToWorld(id);
     if (gsInsideAnyExclusion(worldPos)) return;

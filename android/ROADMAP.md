@@ -229,6 +229,25 @@ warping a 2D image.
   power; nothing is written to flash). Setup tab switches it back on. Nothing ever triggers a
   calibration. Tried off: no more clicks, but temperatures drifted as the sensor warmed, so
   auto stays the default and off is a Setup choice.
+- [x] Paint holes and lumpy walls. Paint vanished where the scan mesh was rebuilt: each depth
+  point was baked into one map only (its dominant normal axis), and a triangle that came back
+  moved or turned found no matching texel and was discarded. Now tilted points (> ~24 deg) go
+  into the second map too, and a pixel with no texel under it takes the texels ~4-8 cm around
+  (P2ProThermalPaint.hlsl). Tried and removed: walls, floors and ceilings as Space Setup
+  (MRUK) planes over the scan mesh. Every mesh fragment tested itself against all planes, and
+  the planes overdrew the view: far too slow on the headset.
+- [x] Scan tuning (`ScanTuning`, Setup tab): voxel size slider 2.5-8 cm (RoomScan patch
+  `SetVoxelSize`: same 384 x 128 x 384 grid, so finer voxels cover a smaller volume; the scan
+  and the painted room restart). The world is now shifted so the floor sits 1.3 m below the
+  volume's centre, which keeps a 2.9 m ceiling inside at 2.5 cm. Freeze seen surfaces: once a
+  second, voxels in a 35 deg cone up to 4 m that reached 90 % of the full weight are frozen
+  (RoomScan patch: weighted `FreezeInView`, `UnfreezeAll`), so converged geometry stops being
+  rebuilt.
+- [x] Temperature band and UI pass: the colour filter is a band (`OverlayStyle.BandLow` ..
+  `BandHigh`) coloured alone (Inside) or left out (Outside). The HUD is a rounded card
+  (`UiRect`, P2Pro/UIRect: SDF rounded rectangles) with rich-text status, the palette bar over
+  the colour range with two draggable band handles, and an All / Inside / Outside switch. The
+  panel shrank (images 0.25 m, buttons 3 cm on a dark card) so it fits the view at arm's length.
 - [ ] Subtract, difference, overlay blend modes, if needed.
 
 ## Phase 4: Supervision 2 (thermal room mesh)
