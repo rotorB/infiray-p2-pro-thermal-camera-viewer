@@ -6,9 +6,11 @@ namespace P2Pro
     /// Temperature where the controller points: a dot on the surface and its °C next to it.
     /// The surface is found by a depth ray march (<see cref="DepthProbe"/>); the temperature is
     /// read only from the room's thermal map (<see cref="ThermalMap.RequestTemperature"/>), the
-    /// same °C the painted mesh shows. Steadied for reading: a missed depth or map answer keeps
-    /// the last one for a moment, the value is smoothed over time and the text changes at most
-    /// a few times a second. Right controller, or the left one when the right is off.
+    /// same °C the painted mesh shows. Both answers come back from the GPU a few frames late, so
+    /// only the distance along the ray is taken from the probe: the dot sits on this frame's ray
+    /// and follows the controller without lag. Steadied for reading: a missed depth or map answer
+    /// keeps the last one for a moment, the value is smoothed over time and the text changes at
+    /// most a few times a second. Right controller, or the left one when the right is off.
     /// </summary>
     public class PointerTemperature : MonoBehaviour
     {
@@ -27,8 +29,8 @@ namespace P2Pro
         Transform _root;
         PanelText _label;
 
-        Vector3 _surface;
-        float _surfaceTime = float.NegativeInfinity;
+        float _distance;                        // along the ray, metres
+        float _distanceTime = float.NegativeInfinity;
         float _celsius = float.NaN;             // smoothed
         float _celsiusTime = float.NegativeInfinity;
         float _nextText;
@@ -51,7 +53,8 @@ namespace P2Pro
             _root.gameObject.SetActive(false);
         }
 
-        void Update()
+        // LateUpdate: after OVRManager has read this frame's controller pose.
+        void LateUpdate()
         {
             if (!TryGetRay(out var ray) || _buttons.Hovered)
             {
@@ -62,20 +65,20 @@ namespace P2Pro
             _probe.Request(new[] { ray }, d =>
             {
                 if (d[0] <= 0) return;
-                var hit = ray.GetPoint(d[0]);
-                // Small moves: smooth out depth noise; large ones: the pointer went elsewhere.
-                _surface = Time.time - _surfaceTime < HoldSeconds && Vector3.Distance(hit, _surface) < JumpMetres
-                    ? Vector3.Lerp(_surface, hit, 0.5f) : hit;
-                _surfaceTime = Time.time;
+                // Small changes: smooth out depth noise; large ones: the pointer went elsewhere.
+                _distance = Time.time - _distanceTime < HoldSeconds && Mathf.Abs(d[0] - _distance) < JumpMetres
+                    ? Mathf.Lerp(_distance, d[0], 0.5f) : d[0];
+                _distanceTime = Time.time;
             });
-            if (Time.time - _surfaceTime > HoldSeconds)
+            if (Time.time - _distanceTime > HoldSeconds)
             {
                 _root.gameObject.SetActive(false);
                 return;
             }
 
-            _map.RequestTemperature(_surface, OnTemperature);
-            Show(_surface);
+            var surface = ray.GetPoint(_distance);
+            _map.RequestTemperature(surface, OnTemperature);
+            Show(surface);
         }
 
         void OnTemperature(float? celsius)
